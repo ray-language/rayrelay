@@ -1,0 +1,31 @@
+// Does close(h) wake a fiber parked in socket_read_bytes(h)?
+import std/net;
+import std/time;
+
+fn main() -> int {
+    let listener = match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Ok(l) => l,
+        Result.Err(e) => { eprint(e); return 1; },
+    };
+    let port = net.local_port(listener);
+    spawn(fn() {
+        net.tcp_connect("127.0.0.1", port);
+        // connected socket kept open, never written to
+    });
+    let server = match (net.tcp_accept(listener)) {
+        Result.Ok(h) => h,
+        Result.Err(e) => { eprint(e); return 1; },
+    };
+    spawn(fn() {
+        time.sleep(300);
+        print("closing handle from another fiber");
+        close(server);
+    });
+    print("reading...");
+    match (net.socket_read_bytes(server)) {
+        Result.Ok(b) => print("read returned Ok, len " + to_string(b.len())),
+        Result.Err(e) => print("read returned Err: " + e),
+    }
+    print("woke up fine");
+    0
+}

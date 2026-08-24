@@ -1,0 +1,39 @@
+// send(ch, Variant(s.field, f(s), reply)) where f mutates s — the exact
+// rayrelay join_flow shape.
+struct Box {
+    n: int,
+    tag: string,
+}
+
+enum Msg {
+    Claim(int, string, Channel<bool>),
+}
+
+fn steal_tag(b: Box) -> string {
+    let out = b.tag;
+    b.tag = "";
+    out
+}
+
+fn main() -> int {
+    let ch: Channel<Msg> = Channel.bounded(4);
+    spawn(fn() {
+        match (recv(ch)) {
+            Option.Some(m) => {
+                match (m) {
+                    Msg.Claim(n, s, reply) => {
+                        print("got " + to_string(n) + ":" + s);
+                        send(reply, true);
+                    },
+                }
+            },
+            Option.None => { },
+        }
+    });
+    let b = Box { n: 7, tag: "hello" };
+    let reply: Channel<bool> = Channel.bounded(1);
+    send(ch, Msg.Claim(b.n, steal_tag(b), reply));
+    recv(reply);
+    print("ok");
+    0
+}

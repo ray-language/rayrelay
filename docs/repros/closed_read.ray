@@ -1,0 +1,31 @@
+import std/net;
+import std/time;
+
+fn main() -> int {
+    let listener = match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Ok(l) => l,
+        Result.Err(e) => { eprint(e); return 1; },
+    };
+    let port = net.local_port(listener);
+    spawn(fn() { net.tcp_connect("127.0.0.1", port); });
+    let server = match (net.tcp_accept(listener)) {
+        Result.Ok(h) => h,
+        Result.Err(e) => { eprint(e); return 1; },
+    };
+    net.set_read_timeout(server, 400);
+    // fiber that closes the handle while main is parked reading
+    spawn(fn() {
+        time.sleep(100);
+        close(server);
+        print("closed from fiber");
+    });
+    var i = 0;
+    while (i < 6) {
+        match (net.socket_read_bytes(server)) {
+            Result.Ok(b) => print("iter " + to_string(i) + ": Ok len " + to_string(b.len())),
+            Result.Err(e) => print("iter " + to_string(i) + ": Err [" + e + "]"),
+        }
+        i = i + 1;
+    }
+    0
+}

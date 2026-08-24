@@ -1,0 +1,38 @@
+import std/net;
+
+fn main() -> int {
+    let listener = match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Ok(l) => l,
+        Result.Err(e) => { eprint(e); return 1; },
+    };
+    let port = net.local_port(listener);
+    let ready: Channel<int> = Channel.bounded(1);
+    spawn(fn() {
+        match (net.tcp_connect("127.0.0.1", port)) {
+            Result.Ok(peer) => {
+                send(ready, peer);
+            },
+            Result.Err(e) => panic(e),
+        }
+    });
+    let server = match (net.tcp_accept(listener)) {
+        Result.Ok(h) => h,
+        Result.Err(e) => { eprint(e); return 1; },
+    };
+    let peer = match (recv(ready)) {
+        Option.Some(p) => p,
+        Option.None => panic("no peer"),
+    };
+    // Close from the SAME fiber that created/uses it (main), then read both ends.
+    close(server);
+    net.set_read_timeout(peer, 500);
+    match (net.socket_read_bytes(peer)) {
+        Result.Ok(b) => print("peer read after close: Ok len " + to_string(b.len()) + (if (b.len() == 0) { " (EOF: FIN arrived)" } else { "" })),
+        Result.Err(e) => print("peer read after close: Err [" + e + "]"),
+    }
+    match (net.socket_read_bytes(server)) {
+        Result.Ok(b) => print("closed handle read: Ok len " + to_string(b.len())),
+        Result.Err(e) => print("closed handle read: Err [" + e + "]"),
+    }
+    0
+}
