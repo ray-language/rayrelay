@@ -1,0 +1,7 @@
+# dependencies downloaded by the package manager
+.ray-deps/
+rayrelay
+*.log
+*.out
+*.err
+*.pid

@@ -1,0 +1,60 @@
+// rayrelay — line-oriented reads over a TCP socket, keeping the leftover.
+//
+// The control handshake is one short text line; everything after it is opaque
+// relayed bytes. A read chunk may contain the line AND the first relayed bytes,
+// so the reader must hand the surplus back — losing it would corrupt the pipe.
+import std/net;
+
+pub struct LineConn {
+    h: int,
+    buf: bytes,
+}
+
+fn empty_bytes() -> bytes {
+    var empty: [int] = [];
+    bytes_of(empty)
+}
+
+pub fn from_handle(h: int) -> LineConn {
+    LineConn { h: h, buf: empty_bytes() }
+}
+
+// Reads until LF (stripping an optional trailing CR). max caps the line length
+// so a hostile client cannot grow the buffer without bound.
+pub fn read_line(c: LineConn, max: int) -> Result<string, string> {
+    while (true) {
+        var i = 0;
+        while (i < c.buf.len()) {
+            if (c.buf[i] == 10) {
+                var stop = i;
+                if (stop > 0 && c.buf[stop - 1] == 13) {
+                    stop = stop - 1;
+                }
+                let line_bytes = c.buf.sub_bytes(0, stop);
+                c.buf = c.buf.sub_bytes(i + 1, c.buf.len());
+                return from_utf8(line_bytes);
+            }
+            i = i + 1;
+        }
+        if (c.buf.len() > max) {
+            return Result.Err("line too long");
+        }
+        let chunk = net.socket_read_bytes(c.h)?;
+        if (chunk.len() == 0) {
+            return Result.Err("connection closed");
+        }
+        c.buf = c.buf + chunk;
+    }
+    Result.Err("unreachable")
+}
+
+// Bytes read past the last line: they belong to the relayed stream.
+pub fn take_leftover(c: LineConn) -> bytes {
+    let out = c.buf;
+    c.buf = empty_bytes();
+    out
+}
+
+pub fn write_line(c: LineConn, s: string) -> Result<int, string> {
+    net.socket_write_bytes(c.h, (s + "\n").to_bytes())
+}

@@ -1,0 +1,67 @@
+// rayrelay — STUN-lite over UDP: tell a client how the world sees it.
+//
+// Request: a datagram starting with "WHOAMI". Reply: "ADDR <host> <port>\n"
+// with the OBSERVED source address — which is what a NATed client needs to
+// attempt hole punching.
+//
+// UDP I/O is BLOCKING in both engines (net/udp defers cooperative yield), so
+// this responder cannot share a process with the TCP relay: a blocked
+// recv_from would freeze every fiber. It runs as its own command/process
+// (`rayrelay stun`), and that constraint is a recorded language finding.
+from net/udp import bind, send_to, recv_from, Packet;
+from net/log import logger, info, warn, field, field_int, emit;
+
+pub fn serve_stun(bind_host: string, port: int) -> int {
+    let lg = logger("rayrelay-stun");
+    match (bind(bind_host, port)) {
+        Result.Err(e) => {
+            emit(field(warn(lg, "udp bind failed"), "error", e));
+            return 1;
+        },
+        Result.Ok(h) => {
+            emit(field_int(info(lg, "stun listening"), "port", port));
+            while (true) {
+                match (recv_from(h)) {
+                    Result.Err(e) => {
+                        emit(field(warn(lg, "recv failed"), "error", e));
+                    },
+                    Result.Ok(pkt) => {
+                        if (starts_with_whoami(pkt.data)) {
+                            let reply = "ADDR " + pkt.host + " " + to_string(pkt.port) + "\n";
+                            send_to(h, pkt.host, pkt.port, reply.to_bytes());
+                        }
+                    },
+                }
+            }
+            0
+        },
+    }
+}
+
+fn starts_with_whoami(data: bytes) -> bool {
+    let tag = "WHOAMI".to_bytes();
+    if (data.len() < tag.len()) {
+        return false;
+    }
+    var i = 0;
+    while (i < tag.len()) {
+        if (data[i] != tag[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// Asks a STUN-lite server for our observed address. BLOCKS until the reply
+// lands: net/udp has no receive timeout yet (another recorded finding), so a
+// lost datagram means waiting for Ctrl-C.
+pub fn probe(host: string, port: int) -> Result<string, string> {
+    let h = bind("0.0.0.0", 0)?;
+    send_to(h, host, port, "WHOAMI".to_bytes())?;
+    let pkt = recv_from(h)?;
+    match (from_utf8(pkt.data)) {
+        Result.Ok(s) => Result.Ok(s.trim()),
+        Result.Err(e) => Result.Err("malformed reply"),
+    }
+}

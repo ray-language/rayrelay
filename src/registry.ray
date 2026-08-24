@@ -1,0 +1,122 @@
+// rayrelay — the registry actor: the ONE owner of all shared state.
+//
+// Fibers have isolated heaps, so the waiting-code table and the metrics
+// registry live in a single actor fiber; every other fiber talks to it through
+// its channel. Sockets cross as plain int handles; the joiner side hands its
+// socket (plus any early bytes) to the waiting host through the host's own
+// notify channel.
+import codes;
+import net/metrics;
+
+// What a waiting host receives: its peer arrived, or the wait timed out. The
+// timeout timer sends into the SAME channel, so the host does a single recv.
+pub enum Waited {
+    Peer(int, bytes),
+    Timeout,
+}
+
+pub enum Reg {
+    Register(Channel<string>, Channel<Waited>),
+    Claim(string, int, bytes, Channel<bool>),
+    Cancel(string),
+    ConnOpen,
+    PairUp,
+    PairDown,
+    AddBytes(int),
+    Scrape(Channel<string>),
+}
+
+pub fn start() -> Channel<Reg> {
+    let ch: Channel<Reg> = Channel.bounded(64);
+    spawn(fn() {
+        actor_loop(ch);
+    });
+    ch
+}
+
+fn new_registry() -> metrics.Registry {
+    let reg = metrics.registry();
+    metrics.register_counter(reg, "rayrelay_connections_total", "TCP connections accepted");
+    metrics.register_counter(reg, "rayrelay_pairs_total", "pairs completed");
+    metrics.register_counter(reg, "rayrelay_relayed_bytes_total", "bytes relayed between peers");
+    metrics.register_counter(reg, "rayrelay_claim_misses_total", "JOIN with unknown/expired code");
+    metrics.register_gauge(reg, "rayrelay_active_pairs", "pairs currently relaying");
+    metrics.register_gauge(reg, "rayrelay_waiting_codes", "hosts waiting for a peer");
+    reg
+}
+
+fn actor_loop(ch: Channel<Reg>) {
+    var waiting: Map<string, Channel<Waited>> = Map.new();
+    let m = new_registry();
+    let none = metrics.no_labels();
+    var running = true;
+    while (running) {
+        match (recv(ch)) {
+            Option.None => {
+                running = false;
+            },
+            Option.Some(msg) => {
+                match (msg) {
+                    Reg.Register(reply, notify) => {
+                        var code = codes.new_code();
+                        while (waiting.contains_key(code)) {
+                            code = codes.new_code();
+                        }
+                        waiting.insert(code, notify);
+                        metrics.set(
+                            m,
+                            "rayrelay_waiting_codes",
+                            none,
+                            waiting.keys().len() as float
+                        );
+                        send(reply, code);
+                    },
+                    Reg.Claim(code, handle, leftover, reply) => {
+                        match (get(waiting, code)) {
+                            Option.Some(notify) => {
+                                waiting.remove(code);
+                                metrics.set(
+                                    m,
+                                    "rayrelay_waiting_codes",
+                                    none,
+                                    waiting.keys().len() as float
+                                );
+                                send(notify, Waited.Peer(handle, leftover));
+                                send(reply, true);
+                            },
+                            Option.None => {
+                                metrics.inc(m, "rayrelay_claim_misses_total", none);
+                                send(reply, false);
+                            },
+                        }
+                    },
+                    Reg.Cancel(code) => {
+                        waiting.remove(code);
+                        metrics.set(
+                            m,
+                            "rayrelay_waiting_codes",
+                            none,
+                            waiting.keys().len() as float
+                        );
+                    },
+                    Reg.ConnOpen => {
+                        metrics.inc(m, "rayrelay_connections_total", none);
+                    },
+                    Reg.PairUp => {
+                        metrics.inc(m, "rayrelay_pairs_total", none);
+                        metrics.add(m, "rayrelay_active_pairs", none, 1.0);
+                    },
+                    Reg.PairDown => {
+                        metrics.add(m, "rayrelay_active_pairs", none, 0.0 - 1.0);
+                    },
+                    Reg.AddBytes(n) => {
+                        metrics.add(m, "rayrelay_relayed_bytes_total", none, n as float);
+                    },
+                    Reg.Scrape(reply) => {
+                        send(reply, metrics.render(m));
+                    },
+                }
+            },
+        }
+    }
+}

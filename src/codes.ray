@@ -1,0 +1,54 @@
+// rayrelay — short pairing codes (xxxx-xxxx).
+//
+// The alphabet drops the confusable characters (0/o, 1/l/i, u/v) so a code
+// survives being read aloud over the phone. Codes route a rendezvous, they are
+// NOT secrets: takeit/msg already encrypt end to end and the relay never sees
+// plaintext.
+
+import std/crypto;
+
+const ALPHABET: string = "23456789abcdefghjkmnpqrstwxyz";
+
+const GROUP: int = 4;
+
+pub fn new_code() -> string {
+    let raw = crypto.random_bytes(GROUP * 2);
+    let n = ALPHABET.len();
+    var out = "";
+    var i = 0;
+    while (i < GROUP * 2) {
+        if (i == GROUP) {
+            out = out + "-";
+        }
+        let idx = raw[i] % n;
+        out = out + ALPHABET.substring(idx, idx + 1);
+        i = i + 1;
+    }
+    out
+}
+
+pub fn is_code(s: string) -> bool {
+    if (s.len() != GROUP * 2 + 1) {
+        return false;
+    }
+    var i = 0;
+    for c in s.chars() {
+        if (i == GROUP) {
+            if (c != '-') {
+                return false;
+            }
+        } else {
+            var found = false;
+            for a in ALPHABET.chars() {
+                if (a == c) {
+                    found = true;
+                }
+            }
+            if (!found) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    true
+}

@@ -1,0 +1,152 @@
+// Full pair through a live relay on localhost: HOST/JOIN handshake, blind
+// pipe in both directions, early bytes, unknown code, and the metrics scrape.
+import std/net;
+import relay;
+import registry;
+import lineio;
+
+fn start_relay() -> int {
+    match (relay.start(
+    relay.ServeOpts { bind: "127.0.0.1", port: 0, idle_ms: 10000, metrics_port: 0 }
+)) {
+        Result.Ok(port) => port,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn connect(port: int) -> lineio.LineConn {
+    match (net.tcp_connect("127.0.0.1", port)) {
+        Result.Ok(h) => lineio.from_handle(h),
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn line_of(c: lineio.LineConn) -> string {
+    match (lineio.read_line(c, 256)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn write_ok(c: lineio.LineConn, s: string) {
+    match (lineio.write_line(c, s)) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+}
+
+// Reads through the LineConn so bytes already buffered behind a control line
+// are not lost (the relay may coalesce "PEER\n" with the first payload).
+fn read_exactly(c: lineio.LineConn, want: int) -> bytes {
+    var buf = lineio.take_leftover(c);
+    while (buf.len() < want) {
+        match (net.socket_read_bytes(c.h)) {
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    panic("peer closed early");
+                }
+                buf = buf + chunk;
+            },
+            Result.Err(e) => panic(e),
+        }
+    }
+    buf
+}
+
+@test
+fn pair_relays_bytes_both_ways() {
+    let port = start_relay();
+    let host = connect(port);
+    write_ok(host, "HOST");
+    let code_line = line_of(host);
+    assert(code_line.starts_with("CODE "));
+    let code = code_line.substring(5, code_line.len());
+
+    let joiner = connect(port);
+    // Pipeline the JOIN with early data: the relay must forward it after OK.
+    match (net.socket_write_bytes(joiner.h, ("JOIN " + code + "\nearly!").to_bytes())) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    assert_eq(line_of(joiner), "OK");
+    assert_eq(line_of(host), "PEER");
+
+    // joiner → host: the early bytes arrive first.
+    let early = read_exactly(host, 6);
+    match (from_utf8(early)) {
+        Result.Ok(s) => assert_eq(s, "early!"),
+        Result.Err(e) => panic(e),
+    }
+
+    // host → joiner and back, through the blind pipe.
+    match (net.socket_write_bytes(host.h, "ping desde host".to_bytes())) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (from_utf8(read_exactly(joiner, 15))) {
+        Result.Ok(s) => assert_eq(s, "ping desde host"),
+        Result.Err(e) => panic(e),
+    }
+    match (net.socket_write_bytes(joiner.h, "pong".to_bytes())) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (from_utf8(read_exactly(host, 4))) {
+        Result.Ok(s) => assert_eq(s, "pong"),
+        Result.Err(e) => panic(e),
+    }
+
+    // Closing one side ends the pipe for the other.
+    close(joiner.h);
+    var closed = false;
+    while (!closed) {
+        match (net.socket_read_bytes(host.h)) {
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    closed = true;
+                }
+            },
+            Result.Err(e) => {
+                closed = true;
+            },
+        }
+    }
+    close(host.h);
+}
+
+@test
+fn unknown_code_is_rejected() {
+    let port = start_relay();
+    let joiner = connect(port);
+    write_ok(joiner, "JOIN zzzz-zzzz");
+    let reply = line_of(joiner);
+    assert(reply.starts_with("ERR "));
+    close(joiner.h);
+}
+
+@test
+fn malformed_command_is_rejected() {
+    let port = start_relay();
+    let c = connect(port);
+    write_ok(c, "WHAT");
+    assert(line_of(c).starts_with("ERR "));
+    close(c.h);
+}
+
+@test
+fn registry_scrape_reports_metrics() {
+    let reg = registry.start();
+    send(reg, registry.Reg.ConnOpen);
+    send(reg, registry.Reg.PairUp);
+    send(reg, registry.Reg.AddBytes(1234));
+    let reply: Channel<string> = Channel.bounded(1);
+    send(reg, registry.Reg.Scrape(reply));
+    match (recv(reply)) {
+        Option.Some(text) => {
+            assert(text.contains("rayrelay_connections_total 1"));
+            assert(text.contains("rayrelay_active_pairs 1"));
+            assert(text.contains("rayrelay_relayed_bytes_total 1234"));
+        },
+        Option.None => panic("no scrape"),
+    }
+}

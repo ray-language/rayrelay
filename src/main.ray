@@ -1,0 +1,132 @@
+// rayrelay — rendezvous + blind relay for takeit and msg.
+import std/time;
+import relay;
+import stun;
+import client;
+from net/log import logger, info, field_int, emit;
+
+const DEFAULT_PORT: int = 7440;
+
+const DEFAULT_STUN_PORT: int = 7441;
+
+const DEFAULT_IDLE_SECS: int = 300;
+
+fn usage() {
+    eprint("usage:");
+    eprint("  rayrelay serve [--bind H] [--port N] [--idle SECS] [--metrics-port N]");
+    eprint("  rayrelay stun  [--bind H] [--port N]");
+    eprint("  rayrelay probe [--server H] [--port N]");
+    eprint("  rayrelay host  [--server H] [--port N]");
+    eprint("  rayrelay join CODE [--server H] [--port N]");
+    eprint("");
+    eprint(
+        "  serve: TCP rendezvous (default port " + to_string(DEFAULT_PORT) + "); pairs pipe blindly, E2E crypto is the apps' job"
+    );
+    eprint(
+        "  stun:  UDP observed-address responder (default port " + to_string(DEFAULT_STUN_PORT) + "); separate process by design"
+    );
+    eprint(
+        "  idle:  per-direction inactivity limit while relaying, 0 = none (default " + to_string(DEFAULT_IDLE_SECS) + ")"
+    );
+}
+
+fn flag_value(av: [string], name: string) -> Option<string> {
+    var i = 0;
+    while (i + 1 < av.len()) {
+        if (av[i] == name) {
+            return Option.Some(av[i + 1]);
+        }
+        i = i + 1;
+    }
+    Option.None
+}
+
+fn flag_int(av: [string], name: string, fallback: int) -> int {
+    match (flag_value(av, name)) {
+        Option.Some(s) => {
+            match (parse_int(s)) {
+                Option.Some(n) => n,
+                Option.None => fallback,
+            }
+        },
+        Option.None => fallback,
+    }
+}
+
+fn flag_str(av: [string], name: string, fallback: string) -> string {
+    match (flag_value(av, name)) {
+        Option.Some(s) => s,
+        Option.None => fallback,
+    }
+}
+
+fn main() -> int {
+    let av = args();
+    if (av.len() < 1) {
+        usage();
+        return 1;
+    }
+    let cmd = av[0];
+    if (cmd == "serve") {
+        let opts = relay.ServeOpts {
+            bind: flag_str(av, "--bind", "0.0.0.0"),
+            port: flag_int(av, "--port", DEFAULT_PORT),
+            idle_ms: flag_int(av, "--idle", DEFAULT_IDLE_SECS) * 1000,
+            metrics_port: flag_int(av, "--metrics-port", 0)
+        };
+        match (relay.start(opts)) {
+            Result.Err(e) => {
+                eprint("rayrelay: " + e);
+                1
+            },
+            Result.Ok(port) => {
+                let lg = logger("rayrelay");
+                emit(field_int(info(lg, "relay listening"), "port", port));
+                match (recv(signals())) {
+                    Option.Some(sig) => {
+                        emit(field_int(info(lg, "shutting down"), "signal", sig));
+                    },
+                    Option.None => { },
+                }
+                0
+            },
+        }
+    } else if (cmd == "stun") {
+        stun.serve_stun(
+            flag_str(av, "--bind", "0.0.0.0"),
+            flag_int(av, "--port", DEFAULT_STUN_PORT)
+        )
+    } else if (cmd == "probe") {
+        let server = flag_str(av, "--server", "127.0.0.1");
+        match (stun.probe(server, flag_int(av, "--port", DEFAULT_STUN_PORT))) {
+            Result.Ok(reply) => {
+                print(reply);
+                0
+            },
+            Result.Err(e) => {
+                eprint("rayrelay: " + e);
+                1
+            },
+        }
+    } else if (cmd == "host") {
+        client.run_host(flag_str(av, "--server", "127.0.0.1"), flag_int(av, "--port", DEFAULT_PORT))
+    } else if (cmd == "join") {
+        if (av.len() < 2 || av[1].starts_with("--")) {
+            eprint("rayrelay: join needs a code");
+            usage();
+            return 1;
+        }
+        client.run_join(
+            flag_str(av, "--server", "127.0.0.1"),
+            flag_int(av, "--port", DEFAULT_PORT),
+            av[1]
+        )
+    } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {
+        usage();
+        0
+    } else {
+        eprint("rayrelay: unknown command: " + cmd);
+        usage();
+        1
+    }
+}

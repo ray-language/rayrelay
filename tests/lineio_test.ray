@@ -1,0 +1,97 @@
+// LineConn over a real localhost socket pair: line split, CRLF, leftover.
+import std/net;
+import lineio;
+
+fn socket_pair() -> (int, int) {
+    let listener = match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Ok(l) => l,
+        Result.Err(e) => panic(e),
+    };
+    let port = net.local_port(listener);
+    let client_ch: Channel<int> = Channel.bounded(1);
+    spawn(fn() {
+        match (net.tcp_connect("127.0.0.1", port)) {
+            Result.Ok(h) => {
+                send(client_ch, h);
+            },
+            Result.Err(e) => panic(e),
+        }
+    });
+    let server = match (net.tcp_accept(listener)) {
+        Result.Ok(h) => h,
+        Result.Err(e) => panic(e),
+    };
+    let client = match (recv(client_ch)) {
+        Option.Some(h) => h,
+        Option.None => panic("no client"),
+    };
+    close(listener);
+    (server, client)
+}
+
+@test
+fn read_line_splits_and_keeps_leftover() {
+    let (server, client) = socket_pair();
+    match (net.socket_write_bytes(client, "JOIN abcd-efgh\r\nearly bytes".to_bytes())) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    let c = lineio.from_handle(server);
+    match (lineio.read_line(c, 128)) {
+        Result.Ok(line) => {
+            assert_eq(line, "JOIN abcd-efgh");
+        },
+        Result.Err(e) => panic(e),
+    }
+    match (from_utf8(lineio.take_leftover(c))) {
+        Result.Ok(rest) => {
+            assert_eq(rest, "early bytes");
+        },
+        Result.Err(e) => panic(e),
+    }
+    close(server);
+    close(client);
+}
+
+@test
+fn read_line_enforces_the_max() {
+    let (server, client) = socket_pair();
+    var big = "";
+    var i = 0;
+    while (i < 300) {
+        big = big + "x";
+        i = i + 1;
+    }
+    match (net.socket_write_bytes(client, big.to_bytes())) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    let c = lineio.from_handle(server);
+    match (lineio.read_line(c, 128)) {
+        Result.Err(e) => {
+            assert(e.contains("too long"));
+        },
+        Result.Ok(line) => panic("expected an error, got: " + line),
+    }
+    close(server);
+    close(client);
+}
+
+@test
+fn write_line_appends_the_newline() {
+    let (server, client) = socket_pair();
+    let c = lineio.from_handle(server);
+    match (lineio.write_line(c, "CODE abcd-efgh")) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    let peer = lineio.from_handle(client);
+    match (lineio.read_line(peer, 128)) {
+        Result.Ok(line) => {
+            assert_eq(line, "CODE abcd-efgh");
+        },
+        Result.Err(e) => panic(e),
+    }
+    close(server);
+    close(client);
+}

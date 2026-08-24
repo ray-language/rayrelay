@@ -1,0 +1,312 @@
+// rayrelay — the TCP rendezvous + blind relay.
+//
+// Protocol (text handshake, then raw bytes):
+//   host   → "HOST\n"          ← "CODE <code>\n" … waits … ← "PEER\n", then pipe
+//   joiner → "JOIN <code>\n"   ← "OK\n" (or "ERR <reason>\n"), then pipe
+//
+// After pairing the relay copies bytes blindly in both directions; the apps on
+// top (takeit, msg) already encrypt end to end, so the relay never sees clear.
+import std/net;
+import std/time;
+import lineio;
+import registry;
+import codes;
+from net/log import logger, info, warn, field, field_int, emit;
+
+const MAX_LINE: int = 128;
+
+const HANDSHAKE_TIMEOUT_MS: int = 30000;
+
+const WAIT_FOR_PEER_MS: int = 600000;
+
+pub struct ServeOpts {
+    bind: string,
+    port: int,
+    idle_ms: int,
+    metrics_port: int,
+}
+
+// Starts the relay (and the /metrics endpoint if metrics_port > 0) and returns
+// the port actually bound (useful with port 0 in tests). Non-blocking: the
+// accept loop runs in its own fiber.
+pub fn start(opts: ServeOpts) -> Result<int, string> {
+    let reg = registry.start();
+    let listener = net.tcp_listen(opts.bind, opts.port)?;
+    let port = net.local_port(listener);
+    let idle_ms = opts.idle_ms;
+    spawn(fn() {
+        accept_loop(listener, reg, idle_ms);
+    });
+    if (opts.metrics_port > 0) {
+        let mbind = opts.bind;
+        let mport = opts.metrics_port;
+        spawn(fn() {
+            metrics_loop(mbind, mport, reg);
+        });
+    }
+    Result.Ok(port)
+}
+
+fn accept_loop(listener: int, reg: Channel<registry.Reg>, idle_ms: int) {
+    let lg = logger("rayrelay");
+    while (true) {
+        match (net.tcp_accept(listener)) {
+            Result.Err(e) => {
+                emit(field(warn(lg, "accept failed"), "error", e));
+                return;
+            },
+            Result.Ok(h) => {
+                send(reg, registry.Reg.ConnOpen);
+                spawn(fn() {
+                    handle_conn(h, reg, idle_ms);
+                });
+            },
+        }
+    }
+}
+
+fn handle_conn(h: int, reg: Channel<registry.Reg>, idle_ms: int) {
+    let lg = logger("rayrelay");
+    net.set_read_timeout(h, HANDSHAKE_TIMEOUT_MS);
+    let c = lineio.from_handle(h);
+    match (lineio.read_line(c, MAX_LINE)) {
+        Result.Err(e) => {
+            close(h);
+        },
+        Result.Ok(line) => {
+            let cmd = line.trim();
+            if (cmd == "HOST") {
+                host_flow(c, reg, idle_ms);
+            } else if (cmd.starts_with("JOIN ")) {
+                join_flow(c, reg, cmd.substring(5, cmd.len()).trim());
+            } else {
+                lineio.write_line(c, "ERR expected HOST or JOIN <code>");
+                close(h);
+            }
+        },
+    }
+}
+
+fn host_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, idle_ms: int) {
+    let lg = logger("rayrelay");
+    let reply: Channel<string> = Channel.bounded(1);
+    let notify: Channel<registry.Waited> = Channel.bounded(2);
+    send(reg, registry.Reg.Register(reply, notify));
+    let code = match (recv(reply)) {
+        Option.Some(s) => s,
+        Option.None => {
+            close(c.h);
+            return;
+        },
+    };
+    match (lineio.write_line(c, "CODE " + code)) {
+        Result.Err(e) => {
+            send(reg, registry.Reg.Cancel(code));
+            close(c.h);
+            return;
+        },
+        Result.Ok(n) => { },
+    }
+    emit(field(info(lg, "host waiting"), "code", code));
+    spawn(fn() {
+        time.sleep(WAIT_FOR_PEER_MS);
+        send(notify, registry.Waited.Timeout);
+    });
+    match (recv(notify)) {
+        Option.Some(w) => {
+            match (w) {
+                registry.Waited.Peer(jh, jleft) => {
+                    pair_up(c, jh, jleft, reg, idle_ms, code);
+                },
+                registry.Waited.Timeout => {
+                    send(reg, registry.Reg.Cancel(code));
+                    emit(field(info(lg, "host wait expired"), "code", code));
+                    lineio.write_line(c, "ERR nobody joined in time");
+                    close(c.h);
+                },
+            }
+        },
+        Option.None => {
+            send(reg, registry.Reg.Cancel(code));
+            close(c.h);
+        },
+    }
+}
+
+fn join_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, code: string) {
+    if (!codes.is_code(code)) {
+        lineio.write_line(c, "ERR malformed code");
+        close(c.h);
+        return;
+    }
+    let reply: Channel<bool> = Channel.bounded(1);
+    // Hoisted to locals on purpose: `Reg.Claim(code, c.h, take_leftover(c), …)`
+    // panics on the native backend ("RefCell already borrowed" — the borrow for
+    // c.h is still held when take_leftover borrows c mutably). Recorded finding.
+    let jh = c.h;
+    let jleft = lineio.take_leftover(c);
+    send(reg, registry.Reg.Claim(code, jh, jleft, reply));
+    let claimed = match (recv(reply)) {
+        Option.Some(ok) => ok,
+        Option.None => false,
+    };
+    if (!claimed) {
+        lineio.write_line(c, "ERR unknown code");
+        close(c.h);
+    }
+}
+
+// The host fiber owns BOTH sockets from here on: announces the pair, forwards
+// the early bytes each side sent ahead, then pumps until either side closes.
+fn pair_up(
+    host: lineio.LineConn,
+    jh: int,
+    jleft: bytes,
+    reg: Channel<registry.Reg>,
+    idle_ms: int,
+    code: string
+) {
+    let lg = logger("rayrelay");
+    let joiner = lineio.from_handle(jh);
+    send(reg, registry.Reg.PairUp);
+    emit(field(info(lg, "pair up"), "code", code));
+    var alive = true;
+    match (lineio.write_line(joiner, "OK")) {
+        Result.Err(e) => {
+            alive = false;
+        },
+        Result.Ok(n1) => { },
+    }
+    match (lineio.write_line(host, "PEER")) {
+        Result.Err(e) => {
+            alive = false;
+        },
+        Result.Ok(n2) => { },
+    }
+    let hleft = lineio.take_leftover(host);
+    if (alive && jleft.len() > 0) {
+        match (net.socket_write_bytes(host.h, jleft)) {
+            Result.Err(e) => {
+                alive = false;
+            },
+            Result.Ok(n3) => { },
+        }
+    }
+    if (alive && hleft.len() > 0) {
+        match (net.socket_write_bytes(jh, hleft)) {
+            Result.Err(e) => {
+                alive = false;
+            },
+            Result.Ok(n4) => { },
+        }
+    }
+    if (!alive) {
+        close(host.h);
+        close(jh);
+        send(reg, registry.Reg.PairDown);
+        return;
+    }
+    // Pumps ALWAYS run with a read timeout. Besides the idle policy, it is the
+    // self-heal for a native-backend bug: close(h) does not wake a fiber
+    // blocked in socket_read_bytes there (the VM wakes it with Err), so after
+    // the first pump closes both sockets the second one only wakes when its
+    // own read times out. idle 0 keeps a 1 h reaper floor instead of forever.
+    let pump_timeout = if (idle_ms > 0) { idle_ms } else { 3600000 };
+    net.set_read_timeout(host.h, pump_timeout);
+    net.set_read_timeout(jh, pump_timeout);
+    let done: Channel<int> = Channel.bounded(2);
+    let hh = host.h;
+    spawn(fn() {
+        pump(hh, jh, reg, done);
+    });
+    spawn(fn() {
+        pump(jh, hh, reg, done);
+    });
+    // Each pump closes its OWN src on exit (same-fiber close works in both
+    // engines). The extra closes here end the session instantly on the VM;
+    // on the native backend closing a socket whose reader is parked is a
+    // silent no-op (recorded finding), so there the second pump lingers
+    // until its read timeout fires and then cleans up after itself.
+    recv(done);
+    close(hh);
+    close(jh);
+    recv(done);
+    send(reg, registry.Reg.PairDown);
+    emit(field(info(lg, "pair down"), "code", code));
+}
+
+// One direction of the blind pipe. Backpressure is the blocking write: if dst
+// stalls, this fiber stalls, src's kernel buffer fills, and the sender blocks.
+fn pump(src: int, dst: int, reg: Channel<registry.Reg>, done: Channel<int>) {
+    var moved = 0;
+    var running = true;
+    while (running) {
+        match (net.socket_read_bytes(src)) {
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    running = false;
+                } else {
+                    match (net.socket_write_bytes(dst, chunk)) {
+                        Result.Ok(n) => {
+                            moved = moved + chunk.len();
+                        },
+                        Result.Err(e) => {
+                            running = false;
+                        },
+                    }
+                }
+            },
+            Result.Err(e) => {
+                running = false;
+            },
+        }
+    }
+    close(src);
+    if (moved > 0) {
+        send(reg, registry.Reg.AddBytes(moved));
+    }
+    send(done, 0);
+}
+
+// Minimal hand-rolled HTTP endpoint: any request gets the Prometheus text.
+fn metrics_loop(bind: string, port: int, reg: Channel<registry.Reg>) {
+    let lg = logger("rayrelay");
+    match (net.tcp_listen(bind, port)) {
+        Result.Err(e) => {
+            emit(field(warn(lg, "metrics listen failed"), "error", e));
+        },
+        Result.Ok(listener) => {
+            emit(field_int(info(lg, "metrics listening"), "port", port));
+            while (true) {
+                match (net.tcp_accept(listener)) {
+                    Result.Err(e) => {
+                        return;
+                    },
+                    Result.Ok(h) => {
+                        spawn(fn() {
+                            serve_scrape(h, reg);
+                        });
+                    },
+                }
+            }
+        },
+    }
+}
+
+fn serve_scrape(h: int, reg: Channel<registry.Reg>) {
+    net.set_read_timeout(h, 5000);
+    net.socket_read_bytes(h);
+    let reply: Channel<string> = Channel.bounded(1);
+    send(reg, registry.Reg.Scrape(reply));
+    let body = match (recv(reply)) {
+        Option.Some(s) => s,
+        Option.None => "",
+    };
+    let payload = body.to_bytes();
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: " + to_string(
+        payload.len()
+    ) + "\r\nConnection: close\r\n\r\n";
+    net.socket_write_bytes(h, head.to_bytes());
+    net.socket_write_bytes(h, payload);
+    close(h);
+}

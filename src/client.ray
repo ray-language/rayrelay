@@ -1,0 +1,207 @@
+// rayrelay — test clients: netcat through the relay.
+//
+// `rayrelay host` prints a code and pipes stdin/stdout through the relay;
+// `rayrelay join <code>` connects to it. Handy for manual testing and as the
+// reference for wiring takeit/msg to a relay.
+import std/net;
+import std/io;
+import std/time;
+import lineio;
+
+pub fn run_host(server: string, port: int) -> int {
+    match (net.tcp_connect(
+    server,
+    port
+)) {
+        Result.Err(e) => {
+            eprint("rayrelay: connect failed: " + e);
+            1
+        },
+        Result.Ok(h) => {
+            let c = lineio.from_handle(h);
+            if (!write_or_close(c, "HOST")) {
+                return 1;
+            }
+            let code = match (expect_line(c, "CODE ")) {
+                Result.Ok(rest) => rest,
+                Result.Err(e) => {
+                    eprint("rayrelay: " + e);
+                    close(h);
+                    return 1;
+                },
+            };
+            eprint("code: " + code);
+            eprint(
+                "peer should run: rayrelay join " + code + " --server " + server + " --port " + to_string(port)
+            );
+            match (expect_line(c, "PEER")) {
+                Result.Ok(rest) => { },
+                Result.Err(e) => {
+                    eprint("rayrelay: " + e);
+                    close(h);
+                    return 1;
+                },
+            }
+            eprint("peer connected");
+            pipe_stdio(c)
+        },
+    }
+}
+
+pub fn run_join(server: string, port: int, code: string) -> int {
+    match (net.tcp_connect(server, port)) {
+        Result.Err(e) => {
+            eprint("rayrelay: connect failed: " + e);
+            1
+        },
+        Result.Ok(h) => {
+            let c = lineio.from_handle(h);
+            if (!write_or_close(c, "JOIN " + code)) {
+                return 1;
+            }
+            match (expect_line(c, "OK")) {
+                Result.Ok(rest) => { },
+                Result.Err(e) => {
+                    eprint("rayrelay: " + e);
+                    close(h);
+                    return 1;
+                },
+            }
+            eprint("connected");
+            pipe_stdio(c)
+        },
+    }
+}
+
+fn write_or_close(c: lineio.LineConn, line: string) -> bool {
+    match (lineio.write_line(c, line)) {
+        Result.Ok(n) => true,
+        Result.Err(e) => {
+            eprint("rayrelay: write failed: " + e);
+            close(c.h);
+            false
+        },
+    }
+}
+
+// Reads one control line and checks the expected prefix ("PEER" and "OK" are
+// exact; "CODE " returns the remainder). An ERR line surfaces its reason.
+fn expect_line(c: lineio.LineConn, want: string) -> Result<string, string> {
+    let line = lineio.read_line(c, 256)?;
+    let t = line.trim();
+    if (t == want.trim() && !want.ends_with(" ")) {
+        return Result.Ok("");
+    }
+    if (want.ends_with(" ") && t.starts_with(want)) {
+        return Result.Ok(t.substring(want.len(), t.len()));
+    }
+    if (t.starts_with("ERR ")) {
+        return Result.Err("server: " + t.substring(4, t.len()));
+    }
+    Result.Err("unexpected reply: " + t)
+}
+
+// Grace period after stdin EOF: raylang has no shutdown(SHUT_WR) half-close,
+// so the netcat idiom "signal EOF, then drain until the peer closes" is not
+// expressible; instead the client keeps draining the socket for this long
+// after stdin ends and then exits (the OS close on process exit is the FIN).
+const STDIN_EOF_GRACE_MS: int = 2000;
+
+// Reader fibers feed two channels and MAIN owns every decision (select +
+// recv). Nothing here closes a socket another fiber is reading: on the native
+// backend that close is a silent no-op (recorded finding) — process exit is
+// what closes the fd and wakes the peer.
+fn pipe_stdio(c: lineio.LineConn) -> int {
+    let h = c.h;
+    let stdin_ch: Channel<bytes> = Channel.bounded(8);
+    let sock_ch: Channel<bytes> = Channel.bounded(8);
+    spawn(fn() {
+        var running = true;
+        while (running) {
+            match (io.read(65536)) {
+                Option.Some(chunk) => {
+                    send(stdin_ch, chunk);
+                },
+                Option.None => {
+                    running = false;
+                },
+            }
+        }
+        close(stdin_ch);
+    });
+    spawn(fn() {
+        var running = true;
+        while (running) {
+            match (net.socket_read_bytes(h)) {
+                Result.Ok(chunk) => {
+                    if (chunk.len() == 0) {
+                        running = false;
+                    } else {
+                        send(sock_ch, chunk);
+                    }
+                },
+                Result.Err(e) => {
+                    running = false;
+                },
+            }
+        }
+        close(sock_ch);
+    });
+    let early = lineio.take_leftover(c);
+    if (early.len() > 0) {
+        io.write_bytes(early);
+        io.flush();
+    }
+    // Channel<bytes> like the others: select() only takes same-typed channels
+    // (heterogeneous select is not expressible — recorded finding).
+    let grace_ch: Channel<bytes> = Channel.bounded(1);
+    var stdin_open = true;
+    var running = true;
+    while (running) {
+        if (stdin_open) {
+            let i = select([stdin_ch, sock_ch]);
+            if (i == 0) {
+                match (recv(stdin_ch)) {
+                    Option.Some(chunk) => {
+                        match (net.socket_write_bytes(h, chunk)) {
+                            Result.Ok(n) => { },
+                            Result.Err(e) => {
+                                running = false;
+                            },
+                        }
+                    },
+                    Option.None => {
+                        stdin_open = false;
+                        spawn(fn() {
+                            time.sleep(STDIN_EOF_GRACE_MS);
+                            var tick: [int] = [];
+                            send(grace_ch, bytes_of(tick));
+                        });
+                    },
+                }
+            } else {
+                running = drain_one(sock_ch);
+            }
+        } else {
+            let i = select([grace_ch, sock_ch]);
+            if (i == 0) {
+                running = false;
+            } else {
+                running = drain_one(sock_ch);
+            }
+        }
+    }
+    0
+}
+
+// One socket chunk to stdout; false when the stream (or the grace) ended.
+fn drain_one(sock_ch: Channel<bytes>) -> bool {
+    match (recv(sock_ch)) {
+        Option.Some(chunk) => {
+            io.write_bytes(chunk);
+            io.flush();
+            true
+        },
+        Option.None => false,
+    }
+}

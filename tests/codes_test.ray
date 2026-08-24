@@ -1,0 +1,33 @@
+// Pairing-code format tests.
+import codes;
+
+@test
+fn code_has_the_expected_shape() {
+    let c = codes.new_code();
+    assert_eq(c.len(), 9);
+    assert(codes.is_code(c));
+    assert_eq(c[4], '-');
+}
+
+@test
+fn codes_do_not_repeat_casually() {
+    var seen: [string] = [];
+    var i = 0;
+    while (i < 50) {
+        let c = codes.new_code();
+        assert(!seen.contains(c));
+        seen.push(c);
+        i = i + 1;
+    }
+}
+
+@test
+fn is_code_rejects_malformed_input() {
+    assert(!codes.is_code(""));
+    assert(!codes.is_code("abcd1234"));
+    assert(!codes.is_code("abcd-123"));
+    assert(!codes.is_code("abcd_efgh"));
+    assert(!codes.is_code("ABCD-EFGH"));
+    assert(!codes.is_code("ab0d-efgh"));
+    assert(!codes.is_code("../../etc"));
+}
