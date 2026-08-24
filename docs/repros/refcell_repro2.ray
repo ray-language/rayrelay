@@ -1,0 +1,116 @@
+// The rayrelay host_flow shape: a notify channel captured by a timer fiber,
+// stored in a Map inside an actor, sent into from the actor when a claim
+// arrives, while the owner fiber is blocked on recv(notify).
+import std/time;
+
+enum Waited {
+    Peer(int, bytes),
+    Timeout,
+}
+
+enum Reg {
+    Register(Channel<string>, Channel<Waited>),
+    Claim(string, int, bytes, Channel<bool>),
+}
+
+fn actor(ch: Channel<Reg>) {
+    var waiting: Map<string, Channel<Waited>> = Map.new();
+    var n = 0;
+    while (true) {
+        match (recv(ch)) {
+            Option.None => {
+                return;
+            },
+            Option.Some(m) => {
+                match (m) {
+                    Reg.Register(reply, notify) => {
+                        let code = "code-" + to_string(n);
+                        n = n + 1;
+                        waiting.insert(code, notify);
+                        send(reply, code);
+                    },
+                    Reg.Claim(code, handle, leftover, reply) => {
+                        match (get(waiting, code)) {
+                            Option.Some(notify) => {
+                                waiting.remove(code);
+                                send(notify, Waited.Peer(handle, leftover));
+                                send(reply, true);
+                            },
+                            Option.None => {
+                                send(reply, false);
+                            },
+                        }
+                    },
+                }
+            },
+        }
+    }
+}
+
+fn host(reg: Channel<Reg>, done: Channel<int>) {
+    let reply: Channel<string> = Channel.bounded(1);
+    let notify: Channel<Waited> = Channel.bounded(2);
+    send(reg, Reg.Register(reply, notify));
+    let code = match (recv(reply)) {
+        Option.Some(s) => s,
+        Option.None => panic("no code"),
+    };
+    spawn(fn() {
+        time.sleep(60000);
+        send(notify, Waited.Timeout);
+    });
+    match (recv(notify)) {
+        Option.Some(w) => {
+            match (w) {
+                Waited.Peer(h, left) => {
+                    send(done, h + left.len());
+                },
+                Waited.Timeout => {
+                    send(done, 0 - 1);
+                },
+            }
+        },
+        Option.None => {
+            send(done, 0 - 2);
+        },
+    }
+}
+
+fn joiner(reg: Channel<Reg>, idx: int) {
+    let reply: Channel<bool> = Channel.bounded(1);
+    send(reg, Reg.Claim("code-" + to_string(idx), idx, b"early", reply));
+    recv(reply);
+}
+
+fn main() -> int {
+    let reg: Channel<Reg> = Channel.bounded(64);
+    spawn(fn() { actor(reg); });
+    let done: Channel<int> = Channel.bounded(64);
+    var i = 0;
+    while (i < 20) {
+        spawn(fn() { host(reg, done); });
+        i = i + 1;
+    }
+    time.sleep(200);
+    var j = 0;
+    while (j < 20) {
+        let jj = j;
+        spawn(fn() { joiner(reg, jj); });
+        j = j + 1;
+    }
+    var got = 0;
+    var total = 0;
+    while (got < 20) {
+        match (recv(done)) {
+            Option.Some(v) => {
+                total = total + v;
+                got = got + 1;
+            },
+            Option.None => {
+                got = 20;
+            },
+        }
+    }
+    print("total: " + to_string(total));
+    0
+}

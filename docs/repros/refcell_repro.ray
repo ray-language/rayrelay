@@ -1,0 +1,55 @@
+// Actor + reply-channel pattern under concurrent senders (native backend).
+import std/time;
+
+enum Msg {
+    Ping(Channel<int>),
+    Bump,
+}
+
+fn actor(ch: Channel<Msg>) {
+    var n = 0;
+    while (true) {
+        match (recv(ch)) {
+            Option.None => {
+                return;
+            },
+            Option.Some(m) => {
+                match (m) {
+                    Msg.Ping(reply) => {
+                        send(reply, n);
+                    },
+                    Msg.Bump => {
+                        n = n + 1;
+                    },
+                }
+            },
+        }
+    }
+}
+
+fn main() -> int {
+    let ch: Channel<Msg> = Channel.bounded(64);
+    spawn(fn() { actor(ch); });
+    var i = 0;
+    while (i < 8) {
+        spawn(fn() {
+            var k = 0;
+            while (k < 1000) {
+                send(ch, Msg.Bump);
+                let reply: Channel<int> = Channel.bounded(1);
+                send(ch, Msg.Ping(reply));
+                recv(reply);
+                k = k + 1;
+            }
+        });
+        i = i + 1;
+    }
+    time.sleep(2000);
+    let reply: Channel<int> = Channel.bounded(1);
+    send(ch, Msg.Ping(reply));
+    match (recv(reply)) {
+        Option.Some(n) => print("count: " + to_string(n)),
+        Option.None => print("closed"),
+    }
+    0
+}
