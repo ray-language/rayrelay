@@ -1,6 +1,6 @@
 # rayrelay
 
-Rendezvous + relay **ciego** para [takeit](../takeit) y [msg](../msg), escrito en [raylang](https://github.com/roberto-ayala/raylang): resuelve el pendiente compartido de ambas apps (dos peers detrás de NAT que no pueden verse) con códigos cortos de emparejamiento, un relay TCP que copia bytes sin mirarlos, y un respondedor STUN-lite por UDP para intentar hole punching. El relay nunca ve claro: las apps de encima ya cifran de extremo a extremo.
+Rendezvous + relay **ciego** para [takeit](../takeit) y [msg](../msg), escrito en [raylang](https://github.com/ray-language/raylang): resuelve el pendiente compartido de ambas apps (dos peers detrás de NAT que no pueden verse) con códigos cortos de emparejamiento, un relay TCP que copia bytes sin mirarlos, y un respondedor STUN-lite por UDP para intentar hole punching. El relay nunca ve claro: las apps de encima ya cifran de extremo a extremo.
 
 ```text
 # En un VPS
