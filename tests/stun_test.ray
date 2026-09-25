@@ -1,0 +1,19 @@
+// probe must not hang when nobody answers: the UDP read timeout surfaces as Err.
+import stun;
+from net/udp import bind;
+import std/net;
+
+@test
+fn probe_gives_up_when_nobody_answers() {
+    // A bound but silent UDP socket: datagrams land, no reply ever comes.
+    let silent = match (bind("127.0.0.1", 0)) {
+        Result.Ok(h) => h,
+        Result.Err(e) => panic(e),
+    };
+    let port = net.local_port(silent);
+    match (stun.probe("127.0.0.1", port)) {
+        Result.Ok(reply) => panic("unexpected reply: " + reply),
+        Result.Err(e) => assert(e.contains("timeout")),
+    }
+    close(silent);
+}

@@ -10,31 +10,22 @@ pub struct LineConn {
     buf: bytes,
 }
 
-fn empty_bytes() -> bytes {
-    var empty: [int] = [];
-    bytes_of(empty)
-}
-
 pub fn from_handle(h: int) -> LineConn {
-    LineConn { h: h, buf: empty_bytes() }
+    LineConn { h: h, buf: b"" }
 }
 
 // Reads until LF (stripping an optional trailing CR). max caps the line length
 // so a hostile client cannot grow the buffer without bound.
 pub fn read_line(c: LineConn, max: int) -> Result<string, string> {
     while (true) {
-        var i = 0;
-        while (i < c.buf.len()) {
-            if (c.buf[i] == 10) {
-                var stop = i;
-                if (stop > 0 && c.buf[stop - 1] == 13) {
-                    stop = stop - 1;
-                }
-                let line_bytes = c.buf.sub_bytes(0, stop);
-                c.buf = c.buf.sub_bytes(i + 1, c.buf.len());
-                return from_utf8(line_bytes);
+        if let Option.Some(i) = c.buf.index_of(b"\n") {
+            var stop = i;
+            if (stop > 0 && c.buf[stop - 1] == 13) {
+                stop = stop - 1;
             }
-            i = i + 1;
+            let line_bytes = c.buf.sub_bytes(0, stop);
+            c.buf = c.buf.sub_bytes(i + 1, c.buf.len());
+            return from_utf8(line_bytes);
         }
         if (c.buf.len() > max) {
             return Result.Err("line too long");
@@ -51,7 +42,7 @@ pub fn read_line(c: LineConn, max: int) -> Result<string, string> {
 // Bytes read past the last line: they belong to the relayed stream.
 pub fn take_leftover(c: LineConn) -> bytes {
     let out = c.buf;
-    c.buf = empty_bytes();
+    c.buf = b"";
     out
 }
 

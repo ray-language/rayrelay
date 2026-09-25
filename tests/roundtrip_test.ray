@@ -98,20 +98,66 @@ fn pair_relays_bytes_both_ways() {
 
     // Closing one side ends the pipe for the other.
     close(joiner.h);
-    var closed = false;
-    while (!closed) {
-        match (net.socket_read_bytes(host.h)) {
+    wait_eof(host);
+    close(host.h);
+}
+
+// Reads until EOF (or an error), discarding anything still in flight.
+fn wait_eof(c: lineio.LineConn) {
+    while (true) {
+        match (net.socket_read_bytes(c.h)) {
             Result.Ok(chunk) => {
                 if (chunk.len() == 0) {
-                    closed = true;
+                    break;
                 }
             },
             Result.Err(e) => {
-                closed = true;
+                break;
             },
         }
     }
+}
+
+@test
+fn half_close_keeps_the_reverse_direction_open() {
+    let port = start_relay();
+    let host = connect(port);
+    write_ok(host, "HOST");
+    let code_line = line_of(host);
+    let joiner = connect(port);
+    write_ok(joiner, "JOIN " + code_line.substring(5, code_line.len()));
+    assert_eq(line_of(joiner), "OK");
+    assert_eq(line_of(host), "PEER");
+
+    // The joiner sends its request and half-closes: the host sees the bytes
+    // and then EOF, yet can still answer through the relay.
+    match (net.socket_write_bytes(joiner.h, "request".to_bytes())) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (net.shutdown_write(joiner.h)) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (from_utf8(read_exactly(host, 7))) {
+        Result.Ok(s) => assert_eq(s, "request"),
+        Result.Err(e) => panic(e),
+    }
+    match (net.socket_read_bytes(host.h)) {
+        Result.Ok(chunk) => assert_eq(chunk.len(), 0),
+        Result.Err(e) => panic(e),
+    }
+    match (net.socket_write_bytes(host.h, "reply".to_bytes())) {
+        Result.Ok(n) => { },
+        Result.Err(e) => panic(e),
+    }
+    match (from_utf8(read_exactly(joiner, 5))) {
+        Result.Ok(s) => assert_eq(s, "reply"),
+        Result.Err(e) => panic(e),
+    }
     close(host.h);
+    wait_eof(joiner);
+    close(joiner.h);
 }
 
 @test

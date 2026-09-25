@@ -5,7 +5,6 @@
 // reference for wiring takeit/msg to a relay.
 import std/net;
 import std/io;
-import std/time;
 import lineio;
 
 pub fn run_host(server: string, port: int) -> int {
@@ -103,47 +102,38 @@ fn expect_line(c: lineio.LineConn, want: string) -> Result<string, string> {
     Result.Err("unexpected reply: " + t)
 }
 
-// Grace period after stdin EOF: raylang has no shutdown(SHUT_WR) half-close,
-// so the netcat idiom "signal EOF, then drain until the peer closes" is not
-// expressible; instead the client keeps draining the socket for this long
-// after stdin ends and then exits (the OS close on process exit is the FIN).
-const STDIN_EOF_GRACE_MS: int = 2000;
-
 // Reader fibers feed two channels and MAIN owns every decision (select +
-// recv). Nothing here closes a socket another fiber is reading: on the native
-// backend that close is a silent no-op (recorded finding) — process exit is
-// what closes the fd and wakes the peer.
+// recv). On stdin EOF the socket is half-closed (shutdown SHUT_WR): the peer
+// sees EOF through the relay while this side keeps printing whatever it still
+// sends, until the peer closes too — the classic netcat idiom.
 fn pipe_stdio(c: lineio.LineConn) -> int {
     let h = c.h;
+    net.set_nodelay(h, true);
+    net.set_keepalive(h, true);
     let stdin_ch: Channel<bytes> = Channel.bounded(8);
     let sock_ch: Channel<bytes> = Channel.bounded(8);
     spawn(fn() {
-        var running = true;
-        while (running) {
+        while (true) {
             match (io.read(65536)) {
-                Option.Some(chunk) => {
-                    send(stdin_ch, chunk);
-                },
+                Option.Some(chunk) => send(stdin_ch, chunk),
                 Option.None => {
-                    running = false;
+                    break;
                 },
             }
         }
         close(stdin_ch);
     });
     spawn(fn() {
-        var running = true;
-        while (running) {
+        while (true) {
             match (net.socket_read_bytes(h)) {
                 Result.Ok(chunk) => {
                     if (chunk.len() == 0) {
-                        running = false;
-                    } else {
-                        send(sock_ch, chunk);
+                        break;
                     }
+                    send(sock_ch, chunk);
                 },
                 Result.Err(e) => {
-                    running = false;
+                    break;
                 },
             }
         }
@@ -154,45 +144,26 @@ fn pipe_stdio(c: lineio.LineConn) -> int {
         io.write_bytes(early);
         io.flush();
     }
-    // Channel<bytes> like the others: select() only takes same-typed channels
-    // (heterogeneous select is not expressible — recorded finding).
-    let grace_ch: Channel<bytes> = Channel.bounded(1);
-    var stdin_open = true;
-    var running = true;
-    while (running) {
-        if (stdin_open) {
-            let i = select([stdin_ch, sock_ch]);
-            if (i == 0) {
-                match (recv(stdin_ch)) {
-                    Option.Some(chunk) => {
-                        match (net.socket_write_bytes(h, chunk)) {
-                            Result.Ok(n) => { },
-                            Result.Err(e) => {
-                                running = false;
-                            },
-                        }
-                    },
-                    Option.None => {
-                        stdin_open = false;
-                        spawn(fn() {
-                            time.sleep(STDIN_EOF_GRACE_MS);
-                            var tick: [int] = [];
-                            send(grace_ch, bytes_of(tick));
-                        });
-                    },
+    while (true) {
+        if (select([stdin_ch, sock_ch]) == 1) {
+            if (!drain_one(sock_ch)) {
+                return 0;
+            }
+            continue;
+        }
+        match (recv(stdin_ch)) {
+            Option.Some(chunk) => {
+                if let Result.Err(e) = net.socket_write_bytes(h, chunk) {
+                    return 0;
                 }
-            } else {
-                running = drain_one(sock_ch);
-            }
-        } else {
-            let i = select([grace_ch, sock_ch]);
-            if (i == 0) {
-                running = false;
-            } else {
-                running = drain_one(sock_ch);
-            }
+            },
+            Option.None => {
+                net.shutdown_write(h);
+                break;
+            },
         }
     }
+    while (drain_one(sock_ch)) { }
     0
 }
 

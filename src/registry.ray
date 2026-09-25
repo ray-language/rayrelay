@@ -49,11 +49,10 @@ fn actor_loop(ch: Channel<Reg>) {
     var waiting: Map<string, Channel<Waited>> = Map.new();
     let m = new_registry();
     let none = metrics.no_labels();
-    var running = true;
-    while (running) {
+    while (true) {
         match (recv(ch)) {
             Option.None => {
-                running = false;
+                break;
             },
             Option.Some(msg) => {
                 match (msg) {
@@ -63,12 +62,7 @@ fn actor_loop(ch: Channel<Reg>) {
                             code = codes.new_code();
                         }
                         waiting.insert(code, notify);
-                        metrics.set(
-                            m,
-                            "rayrelay_waiting_codes",
-                            none,
-                            waiting.keys().len() as float
-                        );
+                        metrics.set(m, "rayrelay_waiting_codes", none, waiting.len() as float);
                         send(reply, code);
                     },
                     Reg.Claim(code, handle, leftover, reply) => {
@@ -79,7 +73,7 @@ fn actor_loop(ch: Channel<Reg>) {
                                     m,
                                     "rayrelay_waiting_codes",
                                     none,
-                                    waiting.keys().len() as float
+                                    waiting.len() as float
                                 );
                                 send(notify, Waited.Peer(handle, leftover));
                                 send(reply, true);
@@ -92,12 +86,7 @@ fn actor_loop(ch: Channel<Reg>) {
                     },
                     Reg.Cancel(code) => {
                         waiting.remove(code);
-                        metrics.set(
-                            m,
-                            "rayrelay_waiting_codes",
-                            none,
-                            waiting.keys().len() as float
-                        );
+                        metrics.set(m, "rayrelay_waiting_codes", none, waiting.len() as float);
                     },
                     Reg.ConnOpen => {
                         metrics.inc(m, "rayrelay_connections_total", none);
@@ -107,7 +96,7 @@ fn actor_loop(ch: Channel<Reg>) {
                         metrics.add(m, "rayrelay_active_pairs", none, 1.0);
                     },
                     Reg.PairDown => {
-                        metrics.add(m, "rayrelay_active_pairs", none, 0.0 - 1.0);
+                        metrics.add(m, "rayrelay_active_pairs", none, -1.0);
                     },
                     Reg.AddBytes(n) => {
                         metrics.add(m, "rayrelay_relayed_bytes_total", none, n as float);
