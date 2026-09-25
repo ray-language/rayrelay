@@ -140,12 +140,7 @@ fn join_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, code: string) {
         return;
     }
     let reply: Channel<bool> = Channel.bounded(1);
-    // Hoisted to locals on purpose: `Reg.Claim(code, c.h, take_leftover(c), …)`
-    // panics on the native backend ("RefCell already borrowed" — the borrow for
-    // c.h is still held when take_leftover borrows c mutably). Recorded finding.
-    let jh = c.h;
-    let jleft = lineio.take_leftover(c);
-    send(reg, registry.Reg.Claim(code, jh, jleft, reply));
+    send(reg, registry.Reg.Claim(code, c.h, lineio.take_leftover(c), reply));
     let claimed = match (recv(reply)) {
         Option.Some(ok) => ok,
         Option.None => false,
@@ -171,101 +166,101 @@ fn pair_up(
     send(reg, registry.Reg.PairUp);
     emit(field(info(lg, "pair up"), "code", code));
     var alive = true;
-    match (lineio.write_line(joiner, "OK")) {
-        Result.Err(e) => {
-            alive = false;
-        },
-        Result.Ok(n1) => { },
+    if let Result.Err(e) = lineio.write_line(joiner, "OK") {
+        alive = false;
     }
-    match (lineio.write_line(host, "PEER")) {
-        Result.Err(e) => {
-            alive = false;
-        },
-        Result.Ok(n2) => { },
+    if let Result.Err(e) = lineio.write_line(host, "PEER") {
+        alive = false;
     }
     let hleft = lineio.take_leftover(host);
     if (alive && jleft.len() > 0) {
-        match (net.socket_write_bytes(host.h, jleft)) {
-            Result.Err(e) => {
-                alive = false;
-            },
-            Result.Ok(n3) => { },
+        if let Result.Err(e) = net.socket_write_bytes(host.h, jleft) {
+            alive = false;
         }
     }
     if (alive && hleft.len() > 0) {
-        match (net.socket_write_bytes(jh, hleft)) {
-            Result.Err(e) => {
-                alive = false;
-            },
-            Result.Ok(n4) => { },
+        if let Result.Err(e) = net.socket_write_bytes(jh, hleft) {
+            alive = false;
         }
     }
+    let hh = host.h;
     if (!alive) {
-        close(host.h);
+        close(hh);
         close(jh);
         send(reg, registry.Reg.PairDown);
         return;
     }
-    // Pumps ALWAYS run with a read timeout. Besides the idle policy, it is the
-    // self-heal for a native-backend bug: close(h) does not wake a fiber
-    // blocked in socket_read_bytes there (the VM wakes it with Err), so after
-    // the first pump closes both sockets the second one only wakes when its
-    // own read times out. idle 0 keeps a 1 h reaper floor instead of forever.
-    let pump_timeout = if (idle_ms > 0) { idle_ms } else { 3600000 };
-    net.set_read_timeout(host.h, pump_timeout);
-    net.set_read_timeout(jh, pump_timeout);
-    let done: Channel<int> = Channel.bounded(2);
-    let hh = host.h;
+    // Long-lived interactive tunnel: no Nagle delay on small writes, and OS
+    // keepalive probes so a peer that vanished without a FIN is reaped even
+    // with --idle 0. The handshake timeout is replaced by the idle policy
+    // (idle 0 clears it: no inactivity limit).
+    for sock in [hh, jh] {
+        net.set_nodelay(sock, true);
+        net.set_keepalive(sock, true);
+        net.set_read_timeout(sock, idle_ms);
+    }
+    let done: Channel<PumpEnd> = Channel.bounded(2);
     spawn(fn() {
         pump(hh, jh, reg, done);
     });
     spawn(fn() {
         pump(jh, hh, reg, done);
     });
-    // Each pump closes its OWN src on exit (same-fiber close works in both
-    // engines). The extra closes here end the session instantly on the VM;
-    // on the native backend closing a socket whose reader is parked is a
-    // silent no-op (recorded finding), so there the second pump lingers
-    // until its read timeout fires and then cleans up after itself.
-    recv(done);
+    // A clean EOF on one side was already forwarded as a half-close, so the
+    // other direction keeps flowing until it ends too. An error (reset, idle
+    // timeout, write failure) tears the whole pair down: closing both sockets
+    // wakes the other pump's parked read on both engines.
+    var ended = 0;
+    while (ended < 2) {
+        if (recv(done) != Option.Some(PumpEnd.Eof)) {
+            close(hh);
+            close(jh);
+        }
+        ended = ended + 1;
+    }
     close(hh);
     close(jh);
-    recv(done);
     send(reg, registry.Reg.PairDown);
     emit(field(info(lg, "pair down"), "code", code));
 }
 
+// How one pump direction finished.
+@derive(Eq)
+enum PumpEnd {
+    Eof,
+    Failed,
+}
+
 // One direction of the blind pipe. Backpressure is the blocking write: if dst
 // stalls, this fiber stalls, src's kernel buffer fills, and the sender blocks.
-fn pump(src: int, dst: int, reg: Channel<registry.Reg>, done: Channel<int>) {
+// EOF on src is propagated as a half-close of dst (shutdown SHUT_WR), so a
+// netcat-style "send, signal EOF, keep reading the reply" peer works end to end.
+fn pump(src: int, dst: int, reg: Channel<registry.Reg>, done: Channel<PumpEnd>) {
     var moved = 0;
-    var running = true;
-    while (running) {
+    var end = PumpEnd.Failed;
+    while (true) {
         match (net.socket_read_bytes(src)) {
             Result.Ok(chunk) => {
                 if (chunk.len() == 0) {
-                    running = false;
-                } else {
-                    match (net.socket_write_bytes(dst, chunk)) {
-                        Result.Ok(n) => {
-                            moved = moved + chunk.len();
-                        },
-                        Result.Err(e) => {
-                            running = false;
-                        },
+                    if let Result.Ok(n) = net.shutdown_write(dst) {
+                        end = PumpEnd.Eof;
                     }
+                    break;
                 }
+                if let Result.Err(e) = net.socket_write_bytes(dst, chunk) {
+                    break;
+                }
+                moved = moved + chunk.len();
             },
             Result.Err(e) => {
-                running = false;
+                break;
             },
         }
     }
-    close(src);
     if (moved > 0) {
         send(reg, registry.Reg.AddBytes(moved));
     }
-    send(done, 0);
+    send(done, end);
 }
 
 // Minimal hand-rolled HTTP endpoint: any request gets the Prometheus text.

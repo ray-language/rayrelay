@@ -37,16 +37,8 @@ pub fn is_code(s: string) -> bool {
             if (c != '-') {
                 return false;
             }
-        } else {
-            var found = false;
-            for a in ALPHABET.chars() {
-                if (a == c) {
-                    found = true;
-                }
-            }
-            if (!found) {
-                return false;
-            }
+        } else if (!ALPHABET.contains(to_string(c))) {
+            return false;
         }
         i = i + 1;
     }
