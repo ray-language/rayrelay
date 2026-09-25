@@ -5,7 +5,10 @@ import std/time;
 fn main() -> int {
     let listener = match (net.tcp_listen("127.0.0.1", 0)) {
         Result.Ok(l) => l,
-        Result.Err(e) => { eprint(e); return 1; },
+        Result.Err(e) => {
+            eprint(e);
+            return 1;
+        },
     };
     let port = net.local_port(listener);
     spawn(fn() {
@@ -14,7 +17,10 @@ fn main() -> int {
     });
     let server = match (net.tcp_accept(listener)) {
         Result.Ok(h) => h,
-        Result.Err(e) => { eprint(e); return 1; },
+        Result.Err(e) => {
+            eprint(e);
+            return 1;
+        },
     };
     spawn(fn() {
         time.sleep(300);

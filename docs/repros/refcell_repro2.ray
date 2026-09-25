@@ -84,18 +84,24 @@ fn joiner(reg: Channel<Reg>, idx: int) {
 
 fn main() -> int {
     let reg: Channel<Reg> = Channel.bounded(64);
-    spawn(fn() { actor(reg); });
+    spawn(fn() {
+        actor(reg);
+    });
     let done: Channel<int> = Channel.bounded(64);
     var i = 0;
     while (i < 20) {
-        spawn(fn() { host(reg, done); });
+        spawn(fn() {
+            host(reg, done);
+        });
         i = i + 1;
     }
     time.sleep(200);
     var j = 0;
     while (j < 20) {
         let jj = j;
-        spawn(fn() { joiner(reg, jj); });
+        spawn(fn() {
+            joiner(reg, jj);
+        });
         j = j + 1;
     }
     var got = 0;

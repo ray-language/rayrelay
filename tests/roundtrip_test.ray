@@ -7,8 +7,8 @@ import lineio;
 
 fn start_relay() -> int {
     match (relay.start(
-    relay.ServeOpts { bind: "127.0.0.1", port: 0, idle_ms: 10000, metrics_port: 0 }
-)) {
+        relay.ServeOpts { bind: "127.0.0.1", port: 0, idle_ms: 10000, metrics_port: 0 }
+    )) {
         Result.Ok(port) => port,
         Result.Err(e) => panic(e),
     }
