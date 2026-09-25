@@ -29,7 +29,9 @@ fn actor(ch: Channel<Msg>) {
 
 fn main() -> int {
     let ch: Channel<Msg> = Channel.bounded(64);
-    spawn(fn() { actor(ch); });
+    spawn(fn() {
+        actor(ch);
+    });
     var i = 0;
     while (i < 8) {
         spawn(fn() {

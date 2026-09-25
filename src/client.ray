@@ -9,10 +9,7 @@ import std/time;
 import lineio;
 
 pub fn run_host(server: string, port: int) -> int {
-    match (net.tcp_connect(
-    server,
-    port
-)) {
+    match (net.tcp_connect(server, port)) {
         Result.Err(e) => {
             eprint("rayrelay: connect failed: " + e);
             1
@@ -32,7 +29,12 @@ pub fn run_host(server: string, port: int) -> int {
             };
             eprint("code: " + code);
             eprint(
-                "peer should run: rayrelay join " + code + " --server " + server + " --port " + to_string(port)
+                "peer should run: rayrelay join "
+                    + code
+                    + " --server "
+                    + server
+                    + " --port "
+                    + to_string(port)
             );
             match (expect_line(c, "PEER")) {
                 Result.Ok(rest) => { },

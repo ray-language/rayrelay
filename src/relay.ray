@@ -303,9 +303,9 @@ fn serve_scrape(h: int, reg: Channel<registry.Reg>) {
         Option.None => "",
     };
     let payload = body.to_bytes();
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: " + to_string(
-        payload.len()
-    ) + "\r\nConnection: close\r\n\r\n";
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: "
+        + to_string(payload.len())
+        + "\r\nConnection: close\r\n\r\n";
     net.socket_write_bytes(h, head.to_bytes());
     net.socket_write_bytes(h, payload);
     close(h);

@@ -20,13 +20,19 @@ fn usage() {
     eprint("  rayrelay join CODE [--server H] [--port N]");
     eprint("");
     eprint(
-        "  serve: TCP rendezvous (default port " + to_string(DEFAULT_PORT) + "); pairs pipe blindly, E2E crypto is the apps' job"
+        "  serve: TCP rendezvous (default port "
+            + to_string(DEFAULT_PORT)
+            + "); pairs pipe blindly, E2E crypto is the apps' job"
     );
     eprint(
-        "  stun:  UDP observed-address responder (default port " + to_string(DEFAULT_STUN_PORT) + "); separate process by design"
+        "  stun:  UDP observed-address responder (default port "
+            + to_string(DEFAULT_STUN_PORT)
+            + "); separate process by design"
     );
     eprint(
-        "  idle:  per-direction inactivity limit while relaying, 0 = none (default " + to_string(DEFAULT_IDLE_SECS) + ")"
+        "  idle:  per-direction inactivity limit while relaying, 0 = none (default "
+            + to_string(DEFAULT_IDLE_SECS)
+            + ")"
     );
 }
 
