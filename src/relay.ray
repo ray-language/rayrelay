@@ -141,10 +141,7 @@ fn join_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, code: string) {
     }
     let reply: Channel<bool> = Channel.bounded(1);
     send(reg, registry.Reg.Claim(code, c.h, lineio.take_leftover(c), reply));
-    let claimed = match (recv(reply)) {
-        Option.Some(ok) => ok,
-        Option.None => false,
-    };
+    let claimed = recv(reply).unwrap_or(false);
     if (!claimed) {
         lineio.write_line(c, "ERR unknown code");
         close(c.h);
@@ -293,10 +290,7 @@ fn serve_scrape(h: int, reg: Channel<registry.Reg>) {
     net.socket_read_bytes(h);
     let reply: Channel<string> = Channel.bounded(1);
     send(reg, registry.Reg.Scrape(reply));
-    let body = match (recv(reply)) {
-        Option.Some(s) => s,
-        Option.None => "",
-    };
+    let body = recv(reply).unwrap_or("");
     let payload = body.to_bytes();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: "
         + to_string(payload.len())
