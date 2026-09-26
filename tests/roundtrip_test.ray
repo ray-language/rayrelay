@@ -111,9 +111,7 @@ fn wait_eof(c: lineio.LineConn) {
                     break;
                 }
             },
-            Result.Err(e) => {
-                break;
-            },
+            Result.Err(e) => break,
         }
     }
 }

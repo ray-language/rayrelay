@@ -249,9 +249,7 @@ fn pump(src: int, dst: int, reg: Channel<registry.Reg>, done: Channel<PumpEnd>) 
                 }
                 moved = moved + chunk.len();
             },
-            Result.Err(e) => {
-                break;
-            },
+            Result.Err(e) => break,
         }
     }
     if (moved > 0) {

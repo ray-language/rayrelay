@@ -129,8 +129,8 @@ compone limpio; `net/metrics` y `net/log` listos para operar.
 
 ## Desarrollo
 
-Requiere raylang ≥ 1.27; la dependencia `net` viene del índice de paquetes
-(`net = "^0.3.3"` en `ray.toml`, versión exacta fijada en `ray.lock`).
+Requiere raylang ≥ 1.27.13 (`[package] raylang`); la dependencia `net` viene del índice de paquetes
+(`net = "^0.3.7"` en `ray.toml`, versión exacta fijada en `ray.lock`).
 
 ```sh
 ray test                                   # 12 tests

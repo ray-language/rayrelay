@@ -36,7 +36,6 @@ pub fn read_line(c: LineConn, max: int) -> Result<string, string> {
         }
         c.buf = c.buf + chunk;
     }
-    Result.Err("unreachable")
 }
 
 // Bytes read past the last line: they belong to the relayed stream.
