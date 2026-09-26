@@ -51,9 +51,7 @@ fn actor_loop(ch: Channel<Reg>) {
     let none = metrics.no_labels();
     while (true) {
         match (recv(ch)) {
-            Option.None => {
-                break;
-            },
+            Option.None => break,
             Option.Some(msg) => {
                 match (msg) {
                     Reg.Register(reply, notify) => {

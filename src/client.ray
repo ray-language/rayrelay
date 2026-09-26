@@ -116,9 +116,7 @@ fn pipe_stdio(c: lineio.LineConn) -> int {
         while (true) {
             match (io.read(65536)) {
                 Option.Some(chunk) => send(stdin_ch, chunk),
-                Option.None => {
-                    break;
-                },
+                Option.None => break,
             }
         }
         close(stdin_ch);
@@ -132,9 +130,7 @@ fn pipe_stdio(c: lineio.LineConn) -> int {
                     }
                     send(sock_ch, chunk);
                 },
-                Result.Err(e) => {
-                    break;
-                },
+                Result.Err(e) => break,
             }
         }
         close(sock_ch);
