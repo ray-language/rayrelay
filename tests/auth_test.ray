@@ -1,0 +1,349 @@
+// Authorized keys: the keys file, the challenge, and a live relay that only lets listed
+// keys host — with their limits, the per-IP strikes and a SIGHUP-style reload.
+import std/net;
+import std/fs;
+import std/crypto;
+import std/hex;
+import std/time;
+import auth;
+import client;
+import lineio;
+import registry;
+import relay;
+
+fn temp_dir() -> string {
+    match (fs.make_temp_dir("rayrelay_auth_")) {
+        Result.Ok(d) => d,
+        Result.Err(e) => panic(e),
+    }
+}
+
+/// A fresh key pair: (seed, public).
+fn new_key() -> (bytes, bytes) {
+    let seed = crypto.random_bytes(32);
+    (seed, crypto.ed25519_public_key(seed).unwrap())
+}
+
+fn write(path: string, text: string) {
+    match (fs.write_file(path, text)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+}
+
+/// A keyed relay on 127.0.0.1:0 reading `keys`; `names` as --name would give them.
+fn start_keyed(dir: string, keys: string, names: [string]) -> relay.Server {
+    let path = dir + "/keys";
+    write(path, keys);
+    match (relay.start(
+        relay.ServeOpts {
+            bind: "127.0.0.1",
+            port: 0,
+            idle_ms: 10000,
+            metrics_port: 0,
+            keys_path: path,
+            names: names
+        }
+    )) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn connect(port: int) -> lineio.LineConn {
+    match (net.tcp_connect("127.0.0.1", port)) {
+        Result.Ok(h) => lineio.from_handle(h),
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn line_of(c: lineio.LineConn) -> string {
+    match (lineio.read_line(c, 256)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn write_ok(c: lineio.LineConn, s: string) {
+    match (lineio.write_line(c, s)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn err_of(r: Result<string, string>) -> string {
+    match (r) {
+        Result.Ok(v) => panic("expected a refusal, got: " + v),
+        Result.Err(e) => e,
+    }
+}
+
+/// HOST as `seed` would, dialing the relay by `name`.
+fn host_as(
+    port: int,
+    name: string,
+    seed: Option<bytes>
+) -> (lineio.LineConn, Result<string, string>) {
+    let c = connect(port);
+    let r = client.host_handshake(c, name, seed);
+    (c, r)
+}
+
+@test
+fn a_keys_file_parses_names_and_limits() {
+    let (_, a) = new_key();
+    let (_, b) = new_key();
+    let text = "# team relay\n\n"
+        + auth.public_line(a, "roberto")
+        + "  pairs=4 daily=200GiB rate=50MiB/s\n"
+        + "\t"
+        + auth.public_line(b, "maria")
+        + "\n";
+    let keys = auth.parse_keys(text).unwrap();
+    assert_eq(keys.len(), 2);
+    assert_eq(keys[0].name, "roberto");
+    assert_eq(keys[0].id, auth.key_id(a));
+    assert_eq(keys[0].limits.pairs, 4);
+    assert_eq(keys[0].limits.daily, 200 * 1073741824);
+    assert_eq(keys[0].limits.rate, 50 * 1048576);
+    assert_eq(keys[1].limits.pairs, 0);
+}
+
+@test
+fn a_bad_keys_file_fails_naming_the_line() {
+    let (_, a) = new_key();
+    let good = auth.public_line(a, "ok");
+    let cases = [
+        "ssh-ed25519:abcd x",
+        "ed25519:zz roberto",
+        "ed25519:abcd roberto",
+        good + " pairs=many",
+        good + " daily=3Q",
+        good + " rate=5M",
+        good + " colour=blue",
+        good + " stray",
+        hex.hex_encode(a)
+    ];
+    for bad in cases {
+        match (auth.parse_keys("# fine\n" + bad + "\n")) {
+            Result.Ok(_) => panic("accepted: " + bad),
+            Result.Err(e) => assert(e.starts_with("line 2: ")),
+        }
+    }
+    match (auth.parse_keys(good + "\n" + auth.public_line(a, "again") + "\n")) {
+        Result.Ok(_) => panic("accepted a duplicate key"),
+        Result.Err(e) => assert(e.contains("twice")),
+    }
+}
+
+@test
+fn sizes_parse_in_powers_of_1024() {
+    assert_eq(auth.parse_size("1234").unwrap(), 1234);
+    assert_eq(auth.parse_size("512K").unwrap(), 524288);
+    assert_eq(auth.parse_size("50MiB").unwrap(), 52428800);
+    assert_eq(auth.parse_size("2gb").unwrap(), 2147483648);
+    assert_eq(auth.parse_size("0").unwrap(), 0);
+    assert(auth.parse_size("MiB").is_err());
+    assert(auth.parse_size("5 parsecs").is_err());
+}
+
+@test
+fn a_signature_answers_one_challenge_for_one_name() {
+    let (seed, public) = new_key();
+    let k = auth.parse_keys(auth.public_line(public, "x")).unwrap()[0];
+    let nonce = crypto.random_bytes(auth.NONCE_LEN);
+    let sig = auth.sign(seed, "Relay.Example.com", k.id, nonce).unwrap();
+    assert(auth.verify(k, "relay.example.com", nonce, sig));
+    assert(!auth.verify(k, "other.example.com", nonce, sig));
+    assert(!auth.verify(k, "relay.example.com", crypto.random_bytes(auth.NONCE_LEN), sig));
+    let (other_seed, _) = new_key();
+    let forged = auth.sign(other_seed, "relay.example.com", k.id, nonce).unwrap();
+    assert(!auth.verify(k, "relay.example.com", nonce, forged));
+    assert(auth.names_accept([], "anything"));
+    assert(auth.names_accept(["relay.example.com"], "RELAY.example.com"));
+    assert(!auth.names_accept(["relay.example.com"], "evil.example.com"));
+}
+
+@test
+fn keygen_writes_a_private_file_only_its_owner_reads() {
+    let dir = temp_dir();
+    let path = dir + "/key";
+    let public = auth.create_private(path).unwrap();
+    let seed = auth.load_private(path).unwrap();
+    assert(crypto.ed25519_public_key(seed).unwrap() == public);
+    match (fs.stat(path)) {
+        Result.Ok(st) => assert_eq(st.mode % 512, 384),
+        Result.Err(e) => panic(e),
+    }
+    assert(auth.create_private(path).is_err());
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn only_a_listed_key_hosts_and_pairs() {
+    let dir = temp_dir();
+    let (seed, public) = new_key();
+    let s = start_keyed(dir, auth.public_line(public, "roberto") + "\n", ["relay.test"]);
+
+    let (host, code) = host_as(s.port, "relay.test", Option.Some(seed));
+    let code = code.unwrap();
+    let joiner = connect(s.port);
+    write_ok(joiner, "JOIN " + code);
+    assert_eq(line_of(joiner), "OK");
+    assert_eq(line_of(host), "PEER");
+    match (net.socket_write_bytes(host.h, b"through")) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+    var got = lineio.take_leftover(joiner);
+    while (got.len() < 7) {
+        got = got + net.socket_read_bytes(joiner.h).unwrap();
+    }
+    assert(got == b"through");
+    close(host.h);
+    close(joiner.h);
+
+    // No key, an unlisted key, the right key for another name: refused.
+    let (c1, plain) = host_as(s.port, "relay.test", Option.None);
+    assert(err_of(plain).contains("needs a key"));
+    close(c1.h);
+    let (stranger, _) = new_key();
+    let (c2, unlisted) = host_as(s.port, "relay.test", Option.Some(stranger));
+    assert(err_of(unlisted).contains("unauthorized"));
+    close(c2.h);
+    let (c3, elsewhere) = host_as(s.port, "evil.test", Option.Some(seed));
+    assert(err_of(elsewhere).contains("unauthorized"));
+    close(c3.h);
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn a_key_on_an_open_relay_is_simply_ignored() {
+    let s = match (relay.start(
+        relay.ServeOpts {
+            bind: "127.0.0.1",
+            port: 0,
+            idle_ms: 10000,
+            metrics_port: 0,
+            keys_path: "",
+            names: []
+        }
+    )) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    let (seed, _) = new_key();
+    let (c, code) = host_as(s.port, "127.0.0.1", Option.Some(seed));
+    assert(code.unwrap().len() == 9);
+    close(c.h);
+}
+
+@test
+fn the_pairs_limit_counts_waiting_hosts() {
+    let dir = temp_dir();
+    let (seed, public) = new_key();
+    let s = start_keyed(dir, auth.public_line(public, "solo") + " pairs=1\n", []);
+    let (first, code) = host_as(s.port, "127.0.0.1", Option.Some(seed));
+    assert(code.is_ok());
+    let (second, refused) = host_as(s.port, "127.0.0.1", Option.Some(seed));
+    assert(err_of(refused).contains("1 transfers at once"));
+    close(second.h);
+    // Once the first one is gone (here: its wait is cancelled by pairing and closing),
+    // the slot frees up.
+    let joiner = connect(s.port);
+    write_ok(joiner, "JOIN " + code.unwrap());
+    assert_eq(line_of(joiner), "OK");
+    close(joiner.h);
+    close(first.h);
+    var ok = false;
+    var tries = 0;
+    while (!ok && tries < 50) {
+        let (again, r) = host_as(s.port, "127.0.0.1", Option.Some(seed));
+        ok = r.is_ok();
+        close(again.h);
+        if (!ok) {
+            time.sleep(20);
+        }
+        tries = tries + 1;
+    }
+    assert(ok);
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn reloading_the_keys_lets_a_new_key_in() {
+    let dir = temp_dir();
+    let (old_seed, old_public) = new_key();
+    let (new_seed, new_public) = new_key();
+    let s = start_keyed(dir, auth.public_line(old_public, "old") + "\n", []);
+    let (c1, before) = host_as(s.port, "127.0.0.1", Option.Some(new_seed));
+    assert(before.is_err());
+    close(c1.h);
+    write(dir + "/keys", auth.public_line(new_public, "new") + "\n");
+    assert_eq(relay.reload(s).unwrap(), 1);
+    let (c2, after) = host_as(s.port, "127.0.0.1", Option.Some(new_seed));
+    assert(after.is_ok());
+    close(c2.h);
+    let (c3, revoked) = host_as(s.port, "127.0.0.1", Option.Some(old_seed));
+    assert(revoked.is_err());
+    close(c3.h);
+    // A broken file keeps the keys in force.
+    write(dir + "/keys", "garbage\n");
+    assert(relay.reload(s).is_err());
+    let (c4, still) = host_as(s.port, "127.0.0.1", Option.Some(new_seed));
+    assert(still.is_ok());
+    close(c4.h);
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn too_many_bad_joins_block_the_ip_for_a_while() {
+    let dir = temp_dir();
+    let (_, public) = new_key();
+    let s = start_keyed(dir, auth.public_line(public, "x") + "\n", []);
+    var i = 0;
+    while (i < registry.MAX_STRIKES) {
+        let c = connect(s.port);
+        write_ok(c, "JOIN zzzz-zzzz");
+        assert_eq(line_of(c), "ERR unknown code");
+        close(c.h);
+        i = i + 1;
+    }
+    let c = connect(s.port);
+    assert(line_of(c).contains("too many failed attempts"));
+    close(c.h);
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn the_rate_limit_slows_a_pair_down() {
+    let dir = temp_dir();
+    let (seed, public) = new_key();
+    let s = start_keyed(dir, auth.public_line(public, "slow") + " rate=64K/s\n", []);
+    let (host, code) = host_as(s.port, "127.0.0.1", Option.Some(seed));
+    let joiner = connect(s.port);
+    write_ok(joiner, "JOIN " + code.unwrap());
+    assert_eq(line_of(joiner), "OK");
+    assert_eq(line_of(host), "PEER");
+    let payload = crypto.random_bytes(96 * 1024);
+    let started = time.monotonic_millis();
+    spawn(fn() {
+        let _ = net.socket_write_bytes(host.h, payload);
+    });
+    var got = lineio.take_leftover(joiner).len();
+    while (got < payload.len()) {
+        got = got + net.socket_read_bytes(joiner.h).unwrap().len();
+    }
+    // 96 KiB at 64 KiB/s: at least about a second and a half.
+    assert(time.monotonic_millis() - started >= 1000);
+    close(host.h);
+    close(joiner.h);
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn relay_ips_drop_their_port() {
+    assert_eq(relay.ip_only("203.0.113.7:51824"), "203.0.113.7");
+    assert_eq(relay.ip_only("[2001:db8::1]:7440"), "[2001:db8::1]");
+    assert_eq(relay.ip_only("?"), "?");
+}

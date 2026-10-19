@@ -4,16 +4,23 @@
 //   host   → "HOST\n"          ← "CODE <code>\n" … waits … ← "PEER\n", then pipe
 //   joiner → "JOIN <code>\n"   ← "OK\n" (or "ERR <reason>\n"), then pipe
 //
+// With --authorized-keys only listed keys may host (see auth.ray):
+//   host   → "HOST <key-id>\n" ← "CHALLENGE <nonce>\n"
+//          → "AUTH <relay-host> <sig>\n" ← "CODE <code>\n" | "ERR <reason>\n" …
+//
 // After pairing the relay copies bytes blindly in both directions; the apps on
 // top (takeit, msg) already encrypt end to end, so the relay never sees clear.
 import std/net;
 import std/time;
+import std/crypto;
+import std/hex;
 import lineio;
 import registry;
 import codes;
+import auth;
 from net/log import logger, info, warn, field, field_int, emit;
 
-const MAX_LINE: int = 128;
+const MAX_LINE: int = 256;
 
 const HANDSHAKE_TIMEOUT_MS: int = 30000;
 
@@ -24,18 +31,47 @@ pub struct ServeOpts {
     port: int,
     idle_ms: int,
     metrics_port: int,
+    /// The authorized keys file; empty = an open relay (anyone may host).
+    keys_path: string,
+    /// The names clients reach this relay by; AUTH must be signed for one of them.
+    /// Empty = any name.
+    names: [string],
 }
 
-// Starts the relay (and the /metrics endpoint if metrics_port > 0) and returns
-// the port actually bound (useful with port 0 in tests). Non-blocking: the
-// accept loop runs in its own fiber.
-pub fn start(opts: ServeOpts) -> Result<int, string> {
+/// A running relay: the port it bound (useful with port 0 in tests) and what reloading
+/// its keys needs.
+pub struct Server {
+    port: int,
+    reg: Channel<registry.Reg>,
+    keys_path: string,
+}
+
+/// What every connection's fiber needs.
+struct Ctx {
+    reg: Channel<registry.Reg>,
+    idle_ms: int,
+    keyed: bool,
+    names: [string],
+}
+
+// Starts the relay (and the /metrics endpoint if metrics_port > 0). Non-blocking:
+// the accept loop runs in its own fiber. With a keys file, a malformed one fails
+// the start.
+pub fn start(opts: ServeOpts) -> Result<Server, string> {
     let reg = registry.start();
+    if (opts.keys_path.len() > 0) {
+        send(reg, registry.Reg.SetKeys(auth.load_keys(opts.keys_path)?));
+    }
     let listener = net.tcp_listen(opts.bind, opts.port)?;
     let port = net.local_port(listener);
-    let idle_ms = opts.idle_ms;
+    let ctx = Ctx {
+        reg: reg,
+        idle_ms: opts.idle_ms,
+        keyed: opts.keys_path.len() > 0,
+        names: opts.names
+    };
     spawn(fn() {
-        accept_loop(listener, reg, idle_ms);
+        accept_loop(listener, ctx);
     });
     if (opts.metrics_port > 0) {
         let mbind = opts.bind;
@@ -44,10 +80,20 @@ pub fn start(opts: ServeOpts) -> Result<int, string> {
             metrics_loop(mbind, mport, reg);
         });
     }
-    Result.Ok(port)
+    Result.Ok(Server { port: port, reg: reg, keys_path: opts.keys_path })
 }
 
-fn accept_loop(listener: int, reg: Channel<registry.Reg>, idle_ms: int) {
+/// Reads the keys file again; on an error the keys in force stay. Returns how many.
+pub fn reload(s: Server) -> Result<int, string> {
+    if (s.keys_path.len() == 0) {
+        return Result.Err("an open relay has no keys to reload");
+    }
+    let keys = auth.load_keys(s.keys_path)?;
+    send(s.reg, registry.Reg.SetKeys(keys));
+    Result.Ok(keys.len())
+}
+
+fn accept_loop(listener: int, ctx: Ctx) {
     let lg = logger("rayrelay");
     while (true) {
         match (net.tcp_accept(listener)) {
@@ -56,19 +102,42 @@ fn accept_loop(listener: int, reg: Channel<registry.Reg>, idle_ms: int) {
                 return;
             },
             Result.Ok(h) => {
-                send(reg, registry.Reg.ConnOpen);
+                send(ctx.reg, registry.Reg.ConnOpen);
                 spawn(fn() {
-                    handle_conn(h, reg, idle_ms);
+                    handle_conn(h, ctx);
                 });
             },
         }
     }
 }
 
-fn handle_conn(h: int, reg: Channel<registry.Reg>, idle_ms: int) {
-    let lg = logger("rayrelay");
+/// The address without its port: `1.2.3.4:5` → `1.2.3.4`, `[::1]:5` → `[::1]`.
+pub fn ip_only(addr: string) -> string {
+    let parts = addr.split(":");
+    if (parts.len() < 2) {
+        return addr;
+    }
+    parts.slice(0, parts.len() - 1).join(":")
+}
+
+fn ip_of(h: int) -> string {
+    match (net.peer_addr(h)) {
+        Result.Ok(a) => ip_only(a),
+        Result.Err(_) => "?",
+    }
+}
+
+fn handle_conn(h: int, ctx: Ctx) {
     net.set_read_timeout(h, HANDSHAKE_TIMEOUT_MS);
     let c = lineio.from_handle(h);
+    let ip = ip_of(h);
+    let allowed: Channel<bool> = Channel.bounded(1);
+    send(ctx.reg, registry.Reg.Allowed(ip, allowed));
+    if (!recv(allowed).unwrap_or(false)) {
+        lineio.write_line(c, "ERR too many failed attempts: try again later");
+        close(h);
+        return;
+    }
     match (lineio.read_line(c, MAX_LINE)) {
         Result.Err(e) => {
             close(h);
@@ -76,9 +145,11 @@ fn handle_conn(h: int, reg: Channel<registry.Reg>, idle_ms: int) {
         Result.Ok(line) => {
             let cmd = line.trim();
             if (cmd == "HOST") {
-                host_flow(c, reg, idle_ms);
+                host_entry(c, ctx, ip, "");
+            } else if (cmd.starts_with("HOST ")) {
+                host_entry(c, ctx, ip, cmd.substring(5, cmd.len()).trim());
             } else if (cmd.starts_with("JOIN ")) {
-                join_flow(c, reg, cmd.substring(5, cmd.len()).trim());
+                join_flow(c, ctx, ip, cmd.substring(5, cmd.len()).trim());
             } else {
                 lineio.write_line(c, "ERR expected HOST or JOIN <code>");
                 close(h);
@@ -87,8 +158,80 @@ fn handle_conn(h: int, reg: Channel<registry.Reg>, idle_ms: int) {
     }
 }
 
-fn host_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, idle_ms: int) {
+/// HOST: straight in on an open relay (a key id is then ignored); on a keyed one, the
+/// challenge, the key's limits, and only then the code.
+fn host_entry(c: lineio.LineConn, ctx: Ctx, ip: string, id: string) {
+    if (!ctx.keyed) {
+        host_flow(c, ctx, "", 0);
+        return;
+    }
+    if (id.len() == 0) {
+        lineio.write_line(c, "ERR unauthorized: this relay needs a key (HOST <key-id>)");
+        close(c.h);
+        return;
+    }
+    let k = match (authenticate(c, ctx, id)) {
+        Option.Some(k) => k,
+        Option.None => {
+            send(ctx.reg, registry.Reg.AuthFailed(ip));
+            emit(field(field(warn(logger("rayrelay"), "auth refused"), "ip", ip), "key", id));
+            lineio.write_line(c, "ERR unauthorized");
+            close(c.h);
+            return;
+        },
+    };
+    let reply: Channel<string> = Channel.bounded(1);
+    send(ctx.reg, registry.Reg.Admit(k.id, reply));
+    let reason = recv(reply).unwrap_or("the relay is shutting down");
+    if (reason.len() > 0) {
+        emit(field(field(info(logger("rayrelay"), "host refused"), "user", k.name), "why", reason));
+        lineio.write_line(c, "ERR " + reason);
+        close(c.h);
+        return;
+    }
+    emit(field(info(logger("rayrelay"), "host authorized"), "user", k.name));
+    let moved = host_flow(c, ctx, k.id, k.limits.rate);
+    send(ctx.reg, registry.Reg.Release(k.id, moved));
+}
+
+/// Sends the challenge and checks the AUTH reply. An unknown id gets a challenge too, so
+/// the answer never tells which ids exist.
+fn authenticate(c: lineio.LineConn, ctx: Ctx, id: string) -> Option<auth.Key> {
+    let found: Channel<Option<auth.Key>> = Channel.bounded(1);
+    send(ctx.reg, registry.Reg.Lookup(id, found));
+    let key = recv(found).unwrap_or(Option.None);
+    let nonce = crypto.random_bytes(auth.NONCE_LEN);
+    if let Result.Err(e) = lineio.write_line(c, "CHALLENGE " + hex.hex_encode(nonce)) {
+        return Option.None;
+    }
+    let line = match (lineio.read_line(c, MAX_LINE)) {
+        Result.Ok(l) => l.trim(),
+        Result.Err(e) => {
+            return Option.None;
+        },
+    };
+    let words = line.split(" ");
+    if (words.len() != 3 || words[0] != "AUTH") {
+        return Option.None;
+    }
+    let (relay_host, sig_hex) = (words[1], words[2]);
+    let sig = match (hex.hex_decode(sig_hex)) {
+        Result.Ok(b) => b,
+        Result.Err(_) => {
+            return Option.None;
+        },
+    };
+    let k = key?;
+    if (!auth.names_accept(ctx.names, relay_host)) {
+        return Option.None;
+    }
+    if (auth.verify(k, relay_host, nonce, sig)) { Option.Some(k) } else { Option.None }
+}
+
+/// Registers the host, waits for its peer and relays. Returns the bytes relayed.
+fn host_flow(c: lineio.LineConn, ctx: Ctx, id: string, rate: int) -> int {
     let lg = logger("rayrelay");
+    let reg = ctx.reg;
     let reply: Channel<string> = Channel.bounded(1);
     let notify: Channel<registry.Waited> = Channel.bounded(2);
     send(reg, registry.Reg.Register(reply, notify));
@@ -96,14 +239,14 @@ fn host_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, idle_ms: int) {
         Option.Some(s) => s,
         Option.None => {
             close(c.h);
-            return;
+            return 0;
         },
     };
     match (lineio.write_line(c, "CODE " + code)) {
         Result.Err(e) => {
             send(reg, registry.Reg.Cancel(code));
             close(c.h);
-            return;
+            return 0;
         },
         Result.Ok(n) => { },
     }
@@ -115,34 +258,36 @@ fn host_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, idle_ms: int) {
     match (recv(notify)) {
         Option.Some(w) => {
             match (w) {
-                registry.Waited.Peer(jh, jleft) => {
-                    pair_up(c, jh, jleft, reg, idle_ms, code);
-                },
+                registry.Waited.Peer(jh, jleft) => pair_up(c, jh, jleft, reg, ctx.idle_ms, code, rate),
                 registry.Waited.Timeout => {
                     send(reg, registry.Reg.Cancel(code));
                     emit(field(info(lg, "host wait expired"), "code", code));
                     lineio.write_line(c, "ERR nobody joined in time");
                     close(c.h);
+                    0
                 },
             }
         },
         Option.None => {
             send(reg, registry.Reg.Cancel(code));
             close(c.h);
+            0
         },
     }
 }
 
-fn join_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, code: string) {
+fn join_flow(c: lineio.LineConn, ctx: Ctx, ip: string, code: string) {
     if (!codes.is_code(code)) {
+        send(ctx.reg, registry.Reg.Strike(ip));
         lineio.write_line(c, "ERR malformed code");
         close(c.h);
         return;
     }
     let reply: Channel<bool> = Channel.bounded(1);
-    send(reg, registry.Reg.Claim(code, c.h, lineio.take_leftover(c), reply));
+    send(ctx.reg, registry.Reg.Claim(code, c.h, lineio.take_leftover(c), reply));
     let claimed = recv(reply).unwrap_or(false);
     if (!claimed) {
+        send(ctx.reg, registry.Reg.Strike(ip));
         lineio.write_line(c, "ERR unknown code");
         close(c.h);
     }
@@ -150,14 +295,16 @@ fn join_flow(c: lineio.LineConn, reg: Channel<registry.Reg>, code: string) {
 
 // The host fiber owns BOTH sockets from here on: announces the pair, forwards
 // the early bytes each side sent ahead, then pumps until either side closes.
+// Returns the bytes relayed (both directions).
 fn pair_up(
     host: lineio.LineConn,
     jh: int,
     jleft: bytes,
     reg: Channel<registry.Reg>,
     idle_ms: int,
-    code: string
-) {
+    code: string,
+    rate: int
+) -> int {
     let lg = logger("rayrelay");
     let joiner = lineio.from_handle(jh);
     send(reg, registry.Reg.PairUp);
@@ -185,7 +332,7 @@ fn pair_up(
         close(hh);
         close(jh);
         send(reg, registry.Reg.PairDown);
-        return;
+        return 0;
     }
     // Long-lived interactive tunnel: no Nagle delay on small writes, and OS
     // keepalive probes so a peer that vanished without a FIN is reaped even
@@ -198,51 +345,72 @@ fn pair_up(
     }
     let done: Channel<PumpEnd> = Channel.bounded(2);
     spawn(fn() {
-        pump(hh, jh, reg, done);
+        pump(hh, jh, reg, done, rate);
     });
     spawn(fn() {
-        pump(jh, hh, reg, done);
+        pump(jh, hh, reg, done, rate);
     });
     // A clean EOF on one side was already forwarded as a half-close, so the
     // other direction keeps flowing until it ends too. An error (reset, idle
     // timeout, write failure) tears the whole pair down: closing both sockets
     // wakes the other pump's parked read on both engines.
     var ended = 0;
+    var moved = jleft.len() + hleft.len();
     while (ended < 2) {
-        if (recv(done) != Option.Some(PumpEnd.Eof)) {
-            close(hh);
-            close(jh);
+        match (recv(done)) {
+            Option.Some(end) => {
+                moved = moved + end.moved;
+                if (!end.eof) {
+                    close(hh);
+                    close(jh);
+                }
+            },
+            Option.None => {
+                close(hh);
+                close(jh);
+            },
         }
         ended = ended + 1;
     }
     close(hh);
     close(jh);
     send(reg, registry.Reg.PairDown);
-    emit(field(info(lg, "pair down"), "code", code));
+    emit(field_int(field(info(lg, "pair down"), "code", code), "bytes", moved));
+    moved
 }
 
-// How one pump direction finished.
-@derive(Eq)
-enum PumpEnd {
-    Eof,
-    Failed,
+// How one pump direction finished: a clean EOF (forwarded as a half-close) or a
+// failure, and how many bytes it moved.
+struct PumpEnd {
+    eof: bool,
+    moved: int,
 }
 
 // One direction of the blind pipe. Backpressure is the blocking write: if dst
 // stalls, this fiber stalls, src's kernel buffer fills, and the sender blocks.
 // EOF on src is propagated as a half-close of dst (shutdown SHUT_WR), so a
 // netcat-style "send, signal EOF, keep reading the reply" peer works end to end.
-fn pump(src: int, dst: int, reg: Channel<registry.Reg>, done: Channel<PumpEnd>) {
+// With rate > 0 (bytes per second) the pump holds each chunk until the rate allows it.
+fn pump(src: int, dst: int, reg: Channel<registry.Reg>, done: Channel<PumpEnd>, rate: int) {
     var moved = 0;
-    var end = PumpEnd.Failed;
+    var eof = false;
+    let started = time.monotonic_millis();
     while (true) {
         match (net.socket_read_bytes(src)) {
             Result.Ok(chunk) => {
                 if (chunk.len() == 0) {
                     if let Result.Ok(n) = net.shutdown_write(dst) {
-                        end = PumpEnd.Eof;
+                        eof = true;
                     }
                     break;
+                }
+                // Wait BEFORE forwarding: a single read can bring a large burst.
+                if (rate > 0) {
+                    let due = (moved + chunk.len()) * 1000 / rate;
+                    let spent = time.monotonic_millis() - started;
+                    if (due > spent) {
+                        time.sleep(due - spent);
+                    }
                 }
                 if let Result.Err(e) = net.socket_write_bytes(dst, chunk) {
                     break;
@@ -255,10 +423,9 @@ fn pump(src: int, dst: int, reg: Channel<registry.Reg>, done: Channel<PumpEnd>) 
     if (moved > 0) {
         send(reg, registry.Reg.AddBytes(moved));
     }
-    send(done, end);
+    send(done, PumpEnd { eof: eof, moved: moved });
 }
 
-// Minimal hand-rolled HTTP endpoint: any request gets the Prometheus text.
 fn metrics_loop(bind: string, port: int, reg: Channel<registry.Reg>) {
     let lg = logger("rayrelay");
     match (net.tcp_listen(bind, port)) {

@@ -1,12 +1,20 @@
 // rayrelay — the registry actor: the ONE owner of all shared state.
 //
-// Fibers have isolated heaps, so the waiting-code table and the metrics
-// registry live in a single actor fiber; every other fiber talks to it through
-// its channel. Sockets cross as plain int handles; the joiner side hands its
-// socket (plus any early bytes) to the waiting host through the host's own
-// notify channel.
+// Fibers have isolated heaps, so the waiting-code table, the authorized keys and what
+// each one is using, the per-IP strike counts and the metrics registry live in a single
+// actor fiber; every other fiber talks to it through its channel. Sockets cross as plain
+// int handles; the joiner side hands its socket (plus any early bytes) to the waiting
+// host through the host's own notify channel.
+import std/time;
 import codes;
+import auth;
 import net/metrics;
+
+/// Failed AUTHs and JOIN misses one IP may rack up per window before the relay stops
+/// talking to it until the window ends.
+pub const MAX_STRIKES: int = 20;
+
+pub const STRIKE_WINDOW_MS: int = 60000;
 
 // What a waiting host receives: its peer arrived, or the wait timed out. The
 // timeout timer sends into the SAME channel, so the host does a single recv.
@@ -24,6 +32,21 @@ pub enum Reg {
     PairDown,
     AddBytes(int),
     Scrape(Channel<string>),
+    /// Replaces the authorized keys (start-up and SIGHUP).
+    SetKeys([auth.Key]),
+    /// The key with this id, if it is authorized.
+    Lookup(string, Channel<Option<auth.Key>>),
+    /// A key wants to host: "" when its limits allow it (and it is now counted), the
+    /// reason otherwise.
+    Admit(string, Channel<string>),
+    /// A key's hosting ended, after relaying this many bytes.
+    Release(string, int),
+    /// A failed JOIN from this IP.
+    Strike(string),
+    /// A refused AUTH from this IP: counted, and a strike.
+    AuthFailed(string),
+    /// May this IP still talk to the relay?
+    Allowed(string, Channel<bool>),
 }
 
 pub fn start() -> Channel<Reg> {
@@ -42,11 +65,50 @@ fn new_registry() -> metrics.Registry {
     metrics.register_counter(reg, "rayrelay_claim_misses_total", "JOIN with unknown/expired code");
     metrics.register_gauge(reg, "rayrelay_active_pairs", "pairs currently relaying");
     metrics.register_gauge(reg, "rayrelay_waiting_codes", "hosts waiting for a peer");
+    metrics.register_gauge(reg, "rayrelay_authorized_keys", "keys allowed to host");
+    metrics.register_counter(reg, "rayrelay_auth_failures_total", "HOST refused: no or bad key");
+    metrics.register_counter(reg, "rayrelay_quota_rejections_total", "HOST refused by a limit");
+    metrics.register_counter(
+        reg,
+        "rayrelay_blocked_connections_total",
+        "connections refused: too many strikes"
+    );
+    metrics.register_counter(reg, "rayrelay_user_bytes_total", "bytes relayed per key");
     reg
+}
+
+/// One IP's strikes in the current window.
+struct Strikes {
+    since: int,
+    count: int,
+}
+
+/// `old` plus one strike; a window that ended starts over.
+fn strike(old: Option<Strikes>) -> Strikes {
+    let now = time.monotonic_millis();
+    match (old) {
+        Option.Some(o) => {
+            if (now - o.since > STRIKE_WINDOW_MS) {
+                Strikes { since: now, count: 1 }
+            } else {
+                Strikes { since: o.since, count: o.count + 1 }
+            }
+        },
+        Option.None => Strikes { since: now, count: 1 },
+    }
+}
+
+fn today() -> string {
+    time.date_stamp(time.now_utc())
 }
 
 fn actor_loop(ch: Channel<Reg>) {
     var waiting: Map<string, Channel<Waited>> = Map.new();
+    var keys: Map<string, auth.Key> = Map.new();
+    var active: Map<string, int> = Map.new();
+    var day = today();
+    var day_bytes: Map<string, int> = Map.new();
+    var strikes: Map<string, Strikes> = Map.new();
     let m = new_registry();
     let none = metrics.no_labels();
     while (true) {
@@ -101,6 +163,87 @@ fn actor_loop(ch: Channel<Reg>) {
                     },
                     Reg.Scrape(reply) => {
                         send(reply, metrics.render(m));
+                    },
+                    Reg.SetKeys(list) => {
+                        keys = Map.new();
+                        for k in list {
+                            keys.insert(k.id, k);
+                        }
+                        metrics.set(m, "rayrelay_authorized_keys", none, keys.len() as float);
+                    },
+                    Reg.Lookup(id, reply) => {
+                        send(reply, get(keys, id));
+                    },
+                    Reg.Admit(id, reply) => {
+                        if (today() != day) {
+                            day = today();
+                            day_bytes = Map.new();
+                        }
+                        let reason = match (get(keys, id)) {
+                            Option.None => "the key is no longer authorized",
+                            Option.Some(k) => {
+                                let using = get(active, id).unwrap_or(0);
+                                let spent = get(day_bytes, id).unwrap_or(0);
+                                if (k.limits.pairs > 0 && using >= k.limits.pairs) {
+                                    "quota: ${k.limits.pairs} transfers at once"
+                                } else if (k.limits.daily > 0 && spent >= k.limits.daily) {
+                                    "quota: daily limit reached"
+                                } else {
+                                    ""
+                                }
+                            },
+                        };
+                        if (reason.len() == 0) {
+                            active.insert(id, get(active, id).unwrap_or(0) + 1);
+                        } else {
+                            metrics.inc(m, "rayrelay_quota_rejections_total", none);
+                        }
+                        send(reply, reason);
+                    },
+                    Reg.Release(id, moved) => {
+                        let using = get(active, id).unwrap_or(0);
+                        if (using <= 1) {
+                            active.remove(id);
+                        } else {
+                            active.insert(id, using - 1);
+                        }
+                        if (today() != day) {
+                            day = today();
+                            day_bytes = Map.new();
+                        }
+                        day_bytes.insert(id, get(day_bytes, id).unwrap_or(0) + moved);
+                        if let Option.Some(k) = get(keys, id) {
+                            metrics.add(
+                                m,
+                                "rayrelay_user_bytes_total",
+                                metrics.labels1("user", k.name),
+                                moved as float
+                            );
+                        }
+                    },
+                    Reg.AuthFailed(ip) => {
+                        metrics.inc(m, "rayrelay_auth_failures_total", none);
+                        strikes.insert(ip, strike(get(strikes, ip)));
+                    },
+                    Reg.Strike(ip) => {
+                        strikes.insert(ip, strike(get(strikes, ip)));
+                    },
+                    Reg.Allowed(ip, reply) => {
+                        let ok = match (get(strikes, ip)) {
+                            Option.None => true,
+                            Option.Some(s) => {
+                                if (time.monotonic_millis() - s.since > STRIKE_WINDOW_MS) {
+                                    strikes.remove(ip);
+                                    true
+                                } else {
+                                    s.count < MAX_STRIKES
+                                }
+                            },
+                        };
+                        if (!ok) {
+                            metrics.inc(m, "rayrelay_blocked_connections_total", none);
+                        }
+                        send(reply, ok);
                     },
                 }
             },
