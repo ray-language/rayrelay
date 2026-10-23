@@ -1,0 +1,281 @@
+// rayrelay — who may HOST: Ed25519 keys, a challenge per connection, and per-key limits.
+//
+// The admin lists the public keys allowed to host in a file, one per line, like SSH's
+// authorized_keys:
+//
+//   ed25519:<64 hex>  <name>  [pairs=N] [daily=SIZE] [rate=SIZE/s]
+//
+// A host proves it holds the private key by signing a fresh nonce:
+//
+//   host  → "HOST <key-id>\n"          key-id = first 16 hex of sha256(public key)
+//   relay ← "CHALLENGE <nonce hex>\n"  32 random bytes, new on every connection
+//   host  → "AUTH <relay-host> <signature hex>\n"
+//
+// The signature covers SIGNING_LABEL, the relay host name the client dialed, the key id
+// and the nonce: it is useless on another connection, and a relay that is not the one
+// the client meant to reach cannot replay it here (when the relay knows its own names).
+// Joiners need no key: the single-use code is their authorization.
+import std/crypto;
+import std/hex;
+import std/fs;
+
+pub const SIGNING_LABEL: string = "rayrelay-auth-v1";
+
+pub const NONCE_LEN: int = 32;
+
+const KEY_PREFIX: string = "ed25519:";
+
+const ID_HEX_LEN: int = 16;
+
+/// What one key may use; 0 = no limit.
+pub struct Limits {
+    /// Codes waiting plus pairs relaying, at once.
+    pairs: int,
+    /// Bytes relayed per UTC day (checked when a host registers).
+    daily: int,
+    /// Bytes per second, per direction of a pair.
+    rate: int,
+}
+
+pub struct Key {
+    id: string,
+    public: bytes,
+    name: string,
+    limits: Limits,
+}
+
+pub fn no_limits() -> Limits {
+    Limits { pairs: 0, daily: 0, rate: 0 }
+}
+
+/// The id a client announces: the first 16 hex of sha256(public key).
+pub fn key_id(public: bytes) -> string {
+    hex.hex_encode(crypto.sha256(public)).substring(0, ID_HEX_LEN)
+}
+
+/// The line an admin adds to the keys file for this public key.
+pub fn public_line(public: bytes, name: string) -> string {
+    KEY_PREFIX + hex.hex_encode(public) + "  " + name
+}
+
+/// What the host signs.
+pub fn signed_message(relay_host: string, id: string, nonce: bytes) -> bytes {
+    (SIGNING_LABEL + "\n" + relay_host.to_lower() + "\n" + id + "\n").to_bytes() + nonce
+}
+
+/// The client's side: the AUTH signature for this challenge.
+pub fn sign(seed: bytes, relay_host: string, id: string, nonce: bytes) -> Result<bytes, string> {
+    match (crypto.ed25519_sign(seed, signed_message(relay_host, id, nonce))) {
+        Option.Some(sig) => Result.Ok(sig),
+        Option.None => Result.Err("the private key is not 32 bytes"),
+    }
+}
+
+/// The relay's side: is `sig` this key's signature over this challenge?
+pub fn verify(k: Key, relay_host: string, nonce: bytes, sig: bytes) -> bool {
+    crypto.ed25519_verify(k.public, signed_message(relay_host, k.id, nonce), sig)
+}
+
+/// A private key file: its first line that is not blank or a comment, 64 hex (the
+/// Ed25519 seed). Returns the seed.
+pub fn parse_private(text: string) -> Result<bytes, string> {
+    for raw in text.split("\n") {
+        let line = raw.trim();
+        if (line.len() == 0 || line.starts_with("#")) {
+            continue;
+        }
+        let seed = match (hex.hex_decode(line)) {
+            Result.Ok(b) => b,
+            Result.Err(_) => {
+                return Result.Err("not a private key (expected 64 hex characters)");
+            },
+        };
+        if (seed.len() != 32) {
+            return Result.Err("not a private key (expected 64 hex characters)");
+        }
+        return Result.Ok(seed);
+    }
+    Result.Err("empty private key file")
+}
+
+pub fn load_private(path: string) -> Result<bytes, string> {
+    match (fs.read_file(path)) {
+        Result.Err(e) => Result.Err("${path}: ${e}"),
+        Result.Ok(text) => match (parse_private(text)) {
+            Result.Err(e) => Result.Err("${path}: ${e}"),
+            Result.Ok(seed) => Result.Ok(seed),
+        },
+    }
+}
+
+/// Creates a private key file (owner-only permissions, set before the key is written)
+/// and returns its public key. Refuses to overwrite an existing file.
+pub fn create_private(path: string) -> Result<bytes, string> {
+    if (fs.exists(path)) {
+        return Result.Err("${path} already exists");
+    }
+    let seed = crypto.random_bytes(32);
+    let public = match (crypto.ed25519_public_key(seed)) {
+        Option.Some(p) => p,
+        Option.None => {
+            return Result.Err("could not derive the public key");
+        },
+    };
+    let h = fs.open(path, "w")?;
+    // Best effort where permission bits exist (not on Windows).
+    let _ = fs.chmod(path, 384);
+    let written = fs.write(
+        h,
+        "# rayrelay private key: keep it secret\n" + hex.hex_encode(seed) + "\n"
+    );
+    close(h);
+    written?;
+    Result.Ok(public)
+}
+
+/// Parses a keys file. Any malformed line fails the whole file, naming the line: a typo
+/// must not silently lock a user out (or let one in).
+pub fn parse_keys(text: string) -> Result<[Key], string> {
+    var out: [Key] = [];
+    var seen: Map<string, bool> = Map.new();
+    var n = 0;
+    for raw in text.split("\n") {
+        n = n + 1;
+        let line = raw.trim();
+        if (line.len() == 0 || line.starts_with("#")) {
+            continue;
+        }
+        let k = match (parse_key_line(line)) {
+            Result.Err(e) => {
+                return Result.Err("line ${n}: ${e}");
+            },
+            Result.Ok(k) => k,
+        };
+        if (seen.contains_key(k.id)) {
+            return Result.Err("line ${n}: the same key appears twice");
+        }
+        seen.insert(k.id, true);
+        out.push(k);
+    }
+    Result.Ok(out)
+}
+
+pub fn load_keys(path: string) -> Result<[Key], string> {
+    match (fs.read_file(path)) {
+        Result.Err(e) => Result.Err("${path}: ${e}"),
+        Result.Ok(text) => match (parse_keys(text)) {
+            Result.Err(e) => Result.Err("${path}: ${e}"),
+            Result.Ok(keys) => Result.Ok(keys),
+        },
+    }
+}
+
+fn parse_key_line(line: string) -> Result<Key, string> {
+    var words: [string] = [];
+    for w in line.replace("\t", " ").split(" ") {
+        if (w.len() > 0) {
+            words.push(w);
+        }
+    }
+    if (words.len() < 2) {
+        return Result.Err("expected: ed25519:<64 hex> <name> [pairs=N] [daily=SIZE] [rate=SIZE/s]");
+    }
+    if (!words[0].starts_with(KEY_PREFIX)) {
+        return Result.Err("the key must start with '${KEY_PREFIX}'");
+    }
+    let public = match (hex.hex_decode(words[0].substring(KEY_PREFIX.len(), words[0].len()))) {
+        Result.Ok(b) => b,
+        Result.Err(_) => {
+            return Result.Err("the key is not hex");
+        },
+    };
+    if (public.len() != 32) {
+        return Result.Err("an Ed25519 public key is 32 bytes (64 hex)");
+    }
+    var limits = no_limits();
+    var i = 2;
+    while (i < words.len()) {
+        let w = words[i];
+        let eq = match (w.index_of("=")) {
+            Option.None => {
+                return Result.Err("unexpected '${w}' (limits are name=value)");
+            },
+            Option.Some(at) => at,
+        };
+        let name = w.substring(0, eq);
+        let value = w.substring(eq + 1, w.len());
+        if (name == "pairs") {
+            limits.pairs = match (parse_int(value)) {
+                Option.Some(p) => {
+                    if (p < 0) {
+                        return Result.Err("pairs must be 0 or more");
+                    }
+                    p
+                },
+                Option.None => {
+                    return Result.Err("pairs=${value}: not a number");
+                },
+            };
+        } else if (name == "daily") {
+            limits.daily = parse_size(value)?;
+        } else if (name == "rate") {
+            if (!value.ends_with("/s")) {
+                return Result.Err("rate=${value}: expected a size per second, like 50MiB/s");
+            }
+            limits.rate = parse_size(value.substring(0, value.len() - 2))?;
+        } else {
+            return Result.Err("unknown limit '${name}' (pairs, daily, rate)");
+        }
+        i = i + 1;
+    }
+    Result.Ok(Key { id: key_id(public), public: public, name: words[1], limits: limits })
+}
+
+/// `1234`, `512K`, `50MiB`, `200GB`, `1T`…: powers of 1024, case-insensitive; 0 = no limit.
+pub fn parse_size(raw: string) -> Result<int, string> {
+    let s = raw.trim().to_lower();
+    var digits = "";
+    var unit = "";
+    for c in s.chars() {
+        if (unit.len() == 0 && c >= '0' && c <= '9') {
+            digits = digits + to_string(c);
+        } else {
+            unit = unit + to_string(c);
+        }
+    }
+    let n = match (parse_int(digits)) {
+        Option.Some(v) => v,
+        Option.None => {
+            return Result.Err("'${raw}': not a size");
+        },
+    };
+    let scale = if (unit == "" || unit == "b") {
+        1
+    } else if (unit == "k" || unit == "kb" || unit == "kib") {
+        1024
+    } else if (unit == "m" || unit == "mb" || unit == "mib") {
+        1048576
+    } else if (unit == "g" || unit == "gb" || unit == "gib") {
+        1073741824
+    } else if (unit == "t" || unit == "tb" || unit == "tib") {
+        1099511627776
+    } else {
+        return Result.Err("'${raw}': unknown unit (K, M, G, T)");
+    };
+    Result.Ok(n * scale)
+}
+
+/// Is `relay_host` (as the client signed it) one of this relay's names? An empty list
+/// accepts any name: the signature then binds the nonce, not the relay.
+pub fn names_accept(names: [string], relay_host: string) -> bool {
+    if (names.len() == 0) {
+        return true;
+    }
+    let h = relay_host.to_lower();
+    for n in names {
+        if (n.to_lower() == h) {
+            return true;
+        }
+    }
+    false
+}

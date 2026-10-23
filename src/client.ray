@@ -5,9 +5,72 @@
 // reference for wiring takeit/msg to a relay.
 import std/net;
 import std/io;
+import std/crypto;
+import std/hex;
 import lineio;
+import auth;
 
-pub fn run_host(server: string, port: int) -> int {
+/// HOST, answering the relay's challenge when it sends one (`seed` = the private key;
+/// None on an open relay). `server` is the name this client dialed: the signature is
+/// bound to it. Returns the code.
+pub fn host_handshake(
+    c: lineio.LineConn,
+    server: string,
+    seed: Option<bytes>
+) -> Result<string, string> {
+    let s = match (seed) {
+        Option.None => {
+            lineio.write_line(c, "HOST")?;
+            return expect_line(c, "CODE ");
+        },
+        Option.Some(s) => s,
+    };
+    let public = match (crypto.ed25519_public_key(s)) {
+        Option.Some(p) => p,
+        Option.None => {
+            return Result.Err("the private key is not 32 bytes");
+        },
+    };
+    let id = auth.key_id(public);
+    lineio.write_line(c, "HOST " + id)?;
+    let line = lineio.read_line(c, 256)?.trim();
+    if (line.starts_with("CODE ")) {
+        return Result.Ok(line.substring(5, line.len()));
+    }
+    if (!line.starts_with("CHALLENGE ")) {
+        return Result.Err(refusal(line));
+    }
+    let nonce = match (hex.hex_decode(line.substring(10, line.len()))) {
+        Result.Ok(n) => n,
+        Result.Err(_) => {
+            return Result.Err("malformed challenge");
+        },
+    };
+    let sig = auth.sign(s, server, id, nonce)?;
+    lineio.write_line(c, "AUTH " + server.to_lower() + " " + hex.hex_encode(sig))?;
+    expect_line(c, "CODE ")
+}
+
+fn refusal(line: string) -> string {
+    if (line.starts_with("ERR ")) {
+        "server: " + line.substring(4, line.len())
+    } else {
+        "unexpected reply: " + line
+    }
+}
+
+pub fn run_host(server: string, port: int, key_path: string) -> int {
+    let seed = if (key_path.len() == 0) {
+        Option.None
+    } else {
+        match (auth.load_private(key_path)) {
+            Result.Ok(s) => Option.Some(s),
+            Result.Err(e) => {
+                eprint("rayrelay: " + e);
+                return 1;
+            },
+        }
+    };
     match (net.tcp_connect(server, port)) {
         Result.Err(e) => {
             eprint("rayrelay: connect failed: " + e);
@@ -15,10 +78,7 @@ pub fn run_host(server: string, port: int) -> int {
         },
         Result.Ok(h) => {
             let c = lineio.from_handle(h);
-            if (!write_or_close(c, "HOST")) {
-                return 1;
-            }
-            let code = match (expect_line(c, "CODE ")) {
+            let code = match (host_handshake(c, server, seed)) {
                 Result.Ok(rest) => rest,
                 Result.Err(e) => {
                     eprint("rayrelay: " + e);
@@ -96,10 +156,7 @@ fn expect_line(c: lineio.LineConn, want: string) -> Result<string, string> {
     if (want.ends_with(" ") && t.starts_with(want)) {
         return Result.Ok(t.substring(want.len(), t.len()));
     }
-    if (t.starts_with("ERR ")) {
-        return Result.Err("server: " + t.substring(4, t.len()));
-    }
-    Result.Err("unexpected reply: " + t)
+    Result.Err(refusal(t))
 }
 
 // Reader fibers feed two channels and MAIN owns every decision (select +
